@@ -46,19 +46,20 @@ class MilvusImporter:
     """从 CSV 导入数据到本地 Milvus，并同步记录到 MySQL 的 CrawlTask/CrawlBlock"""
 
     def __init__(self, local_host: Optional[str] = None, local_port: Optional[str] = None):
-        # 默认使用 localhost，方便在宿主机直接连接 Docker 暴露出来的 Milvus 端口
-        # 如果你在容器内部运行脚本，可以显式传入 --local-host milvus-standalone
-        self.local_host = local_host or "localhost"
+        # 默认使用配置中的 Milvus 主机名：
+        # - 容器内执行时来自 docker-compose: milvus-standalone
+        # - 宿主机直接执行时可通过 --local-host localhost 覆盖
+        self.local_host = local_host or settings.MILVUS_HOST
         self.local_port = local_port or settings.MILVUS_PORT
         self.client: Optional[MilvusClient] = None
 
         # --- MySQL (同步) ---
         # 这里复用 crawler.py 中的同步连接方式，方便脚本直接运行
-        # 在宿主机（Windows）上直接运行脚本时，MySQL 是通过 Docker 映射到本机 3306 端口的，
-        # 这里显式使用 localhost，避免使用容器内部的主机名（如 "mysql"）导致解析失败。
+        # 容器内执行时使用 docker-compose 注入的 MYSQL_HOST=mysql；
+        # 宿主机直接执行时可通过环境变量 MYSQL_HOST=localhost 覆盖。
         sync_db_url = (
             f"mysql+pymysql://{settings.MYSQL_USER}:{settings.MYSQL_PASSWORD}"
-            f"@localhost:{settings.MYSQL_PORT}/{settings.MYSQL_DATABASE}"
+            f"@{settings.MYSQL_HOST}:{settings.MYSQL_PORT}/{settings.MYSQL_DATABASE}"
         )
         self.sync_engine = create_engine(sync_db_url, echo=False, pool_pre_ping=True)
         self.SyncSessionLocal = sessionmaker(
@@ -224,7 +225,10 @@ class MilvusImporter:
             url=url,
             title=title,
             section=section,
+            collection_name=collection_name,
+            access_scope="public" if collection_name == settings.COLLECTION_STANDARD else "campus",
             text_preview=text_preview,
+            text_content=text_for_preview,
         )
         return crawl_block
 

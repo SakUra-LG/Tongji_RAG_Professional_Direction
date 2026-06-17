@@ -1,19 +1,216 @@
 from abc import ABC, abstractmethod
 from typing import List, Generator
+import logging
+import re
 import jieba
 from app.dto import RequestPayload, UserContext, Document
-from app.components import HistoryManager, VectorRetriever, LLMGenerator
+from app.components import (
+    HistoryManager,
+    LLMGenerator,
+    LocalFAQRetriever,
+    parse_source_reference,
+    QueryIntentRouter,
+    StructuredDataRetriever,
+    VectorRetriever,
+)
 from app.config import settings
+
+logger = logging.getLogger(__name__)
+SERVICE_UNAVAILABLE_MESSAGE = "问答服务暂时不可用，请稍后重试。"
 
 class BasePipeline(ABC):
     def __init__(self):
         self.history_mgr = HistoryManager()
         self.retriever = VectorRetriever()
+        self.local_faq_retriever = LocalFAQRetriever()
+        self.structured_retriever = StructuredDataRetriever()
         self.llm_service = LLMGenerator()
+        self._last_response_metadata = None
+
+    def _reset_metadata(self) -> None:
+        self._last_response_metadata = None
+
+    def consume_response_metadata(self) -> dict:
+        metadata = self._last_response_metadata or self._build_response_metadata(
+            docs=[],
+            answer_origin="llm",
+        )
+        self._last_response_metadata = None
+        return metadata
+
+    @staticmethod
+    def _source_type(doc: Document) -> str:
+        if doc.metadata.get("is_faq"):
+            return "faq"
+        if doc.metadata.get("record_type") in {"profile", "schedule", "grades"}:
+            return "personal"
+        if doc.metadata.get("record_type") == "notice":
+            return "notice"
+        return "rag"
+
+    def _build_response_metadata(
+        self,
+        docs: List[Document],
+        answer_origin: str,
+    ) -> dict:
+        unique_sources = []
+        seen = set()
+        for doc in docs:
+            source_info = parse_source_reference(doc.source)
+            key = (source_info["source_title"], source_info["source_url"], doc.content[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_sources.append(
+                {
+                    "title": source_info["source_title"],
+                    "url": source_info["source_url"] or None,
+                    "snippet": " ".join(doc.content.split())[:320],
+                    "score": round(float(doc.score or 0.0), 4),
+                    "source_type": self._source_type(doc),
+                }
+            )
+            if len(unique_sources) >= 5:
+                break
+
+        if not docs:
+            confidence = "low"
+            notice = "当前资料库中未检索到足够相关资料，以下回答由大模型基于通用知识生成，请以学校官方信息为准。"
+        else:
+            max_score = max(float(doc.score or 0.0) for doc in docs)
+            if max_score >= 0.78 or len(docs) >= 3:
+                confidence = "high"
+            elif max_score >= 0.45:
+                confidence = "medium"
+            else:
+                confidence = "low"
+            notice = (
+                "已基于当前资料库检索结果生成回答，可展开查看来源片段。"
+                if confidence != "low"
+                else "检索命中较弱，资料可能不足，回答仅供参考。"
+            )
+
+        return {
+            "answer_origin": answer_origin,
+            "confidence": confidence,
+            "notice": notice,
+            "sources": unique_sources,
+        }
+
+    def _set_direct_metadata(self, doc: Document, answer_origin: str = "faq") -> None:
+        self._last_response_metadata = self._build_response_metadata(
+            docs=[doc],
+            answer_origin=answer_origin,
+        )
+
+    @staticmethod
+    def _extract_llm_only_query(query: str) -> str | None:
+        normalized = re.sub(r"\s+", "", query.lower())
+        llm_only_markers = (
+            "全部基于llm",
+            "全基于llm",
+            "只用llm",
+            "仅用llm",
+            "用llm回答",
+            "使用llm回答",
+            "全部基于大模型",
+            "全基于大模型",
+            "只用大模型",
+            "仅用大模型",
+            "用大模型回答",
+            "使用大模型回答",
+            "全部基于语言模型",
+            "仅用语言模型",
+            "只用语言模型",
+        )
+        no_database_markers = (
+            "不使用资料库",
+            "不用资料库",
+            "不查资料库",
+            "不走资料库",
+            "不要使用资料库",
+            "不要查资料库",
+            "不要检索资料库",
+            "跳过资料库",
+            "不使用知识库",
+            "不用知识库",
+            "不查知识库",
+            "不走知识库",
+            "不要使用知识库",
+            "不要查知识库",
+            "不要检索知识库",
+            "跳过知识库",
+            "不使用rag",
+            "不用rag",
+            "不走rag",
+            "跳过rag",
+        )
+        if not any(marker in normalized for marker in llm_only_markers + no_database_markers):
+            return None
+
+        stripped = query
+        leading_directives = (
+            r"^\s*(?:本次|这次|此次|当前|这个问题)?(?:回答|回复)?(?:请|麻烦)?"
+            r"(?:全部|完全)?(?:基于|使用|用|只用|仅用)"
+            r"(?:llm|LLM|大模型|语言模型)(?:回答|回复)?[，,。:：；;\s]*",
+            r"^\s*(?:本次|这次|此次|当前|这个问题)?(?:回答|回复)?(?:请|麻烦)?"
+            r"(?:不要|别|无需|不用|不使用|不查|不要查|不要使用|不要检索|跳过|不走)"
+            r"(?:当前)?(?:的)?(?:资料库|知识库|数据库|rag|RAG)"
+            r"(?:内容|检索|资料)?(?:回答|回复)?[，,。:：；;\s]*",
+        )
+        for pattern in leading_directives:
+            stripped = re.sub(pattern, "", stripped, count=1, flags=re.IGNORECASE)
+        stripped = stripped.strip(" \t\r\n，,。:：；;")
+        return stripped or query
+
+    @staticmethod
+    def _llm_only_prompt() -> str:
+        return """你是一个通用大模型助手。本次用户明确要求不使用项目资料库、知识库或 RAG 检索结果。
+请直接基于通用知识回答用户问题；如果问题涉及时效性、校内政策、个人信息、教务数据等可能需要权威资料确认的内容，要主动说明未使用资料库，结论仅供参考。
+
+【用户问题】
+{question}
+
+【回答】"""
+
+    def _answer_with_llm_only(
+        self,
+        query: str,
+        session_id: str,
+    ) -> Generator[str, None, None]:
+        full_answer = ""
+        try:
+            for chunk in self.llm_service.generate_answer(
+                query,
+                [],
+                self._llm_only_prompt(),
+            ):
+                full_answer += chunk
+                yield chunk
+        except Exception:
+            logger.exception("LLM-only answer generation failed")
+            full_answer = SERVICE_UNAVAILABLE_MESSAGE
+            yield full_answer
+        self.history_mgr.append_ai_message(session_id, full_answer)
+        self._last_response_metadata = {
+            "answer_origin": "llm",
+            "confidence": "low",
+            "notice": "已按用户要求跳过资料库检索，本次回答由大模型基于通用知识生成，请以权威来源为准。",
+            "sources": [],
+        }
 
     def execute(self, request: RequestPayload, user: UserContext) -> Generator[str, None, None]:
+        self._reset_metadata()
         # 获取历史
         history = self.history_mgr.get_recent_turns(request.session_id)
+        early_llm_only_query = self._extract_llm_only_query(request.query)
+        if early_llm_only_query:
+            self.history_mgr.append_user_message(request.session_id, request.query)
+            yield from self._answer_with_llm_only(
+                early_llm_only_query,
+                request.session_id,
+            )
+            return
         
         # 查询重写
         rewritten_query = self.llm_service.rewrite_query(history, request.query)
@@ -23,6 +220,14 @@ class BasePipeline(ABC):
         self.history_mgr.append_user_message(request.session_id, request.query)
         
         # 执行具体检索策略
+        llm_only_query = self._extract_llm_only_query(request.query)
+        if llm_only_query:
+            yield from self._answer_with_llm_only(
+                llm_only_query,
+                request.session_id,
+            )
+            return
+
         docs = self._retrieve_strategy(rewritten_query.rewritten_text, user)
 
         # --- 调试日志打印开始 ---
@@ -50,12 +255,17 @@ class BasePipeline(ABC):
                 full_answer += chunk
                 yield chunk
         except Exception as e:
-            err = f"生成出错: {str(e)}"
+            logger.exception("Answer generation failed")
+            err = SERVICE_UNAVAILABLE_MESSAGE
             full_answer += err
             yield err
             
         # 记录 AI 回答
         self.history_mgr.append_ai_message(request.session_id, full_answer)
+        self._last_response_metadata = self._build_response_metadata(
+            docs=docs,
+            answer_origin="rag" if docs else "llm",
+        )
 
     def _keyword_rerank(self, query: str, docs: List[Document], final_k: int = 3) -> List[Document]:
         """
@@ -108,21 +318,562 @@ class BasePipeline(ABC):
 
 # --- 具体业务实现 ---
 
+class AutoPipeline(BasePipeline):
+    """Single entry point that applies identity-aware retrieval automatically."""
+
+    FAQ_THRESHOLD = 0.8
+    PERSONAL_VECTOR_THRESHOLD = 0.55
+    CAMPUS_VECTOR_THRESHOLD = 0.45
+
+    @staticmethod
+    def _can_attempt_faq(route_intent: str, query: str) -> bool:
+        if route_intent in {"clarification", "general"}:
+            return False
+        return LocalFAQRetriever.is_specific_faq_query(query)
+
+    @staticmethod
+    def _is_relevant(query: str, doc: Document, threshold: float) -> bool:
+        if doc.score < threshold:
+            return False
+        keywords = {
+            word
+            for word in jieba.lcut_for_search(query)
+            if len(word.strip()) > 1
+        }
+        has_keyword = any(word in doc.content for word in keywords)
+        return has_keyword or doc.score >= 0.75
+
+    @staticmethod
+    def _filter_notices(query: str, docs: List[Document]) -> List[Document]:
+        if any(word in query for word in ("通知", "公告", "校内消息", "学校消息")):
+            return docs
+        keywords = {
+            word
+            for word in jieba.lcut_for_search(query)
+            if len(word.strip()) > 1
+        }
+        return [
+            doc
+            for doc in docs
+            if any(word in doc.content for word in keywords)
+        ]
+
+    def execute(self, request: RequestPayload, user: UserContext) -> Generator[str, None, None]:
+        self._reset_metadata()
+        history = self.history_mgr.get_recent_turns(request.session_id)
+        self.history_mgr.append_user_message(request.session_id, request.query)
+        llm_only_query = self._extract_llm_only_query(request.query)
+        if llm_only_query:
+            yield from self._answer_with_llm_only(
+                llm_only_query,
+                request.session_id,
+            )
+            return
+
+        routing_context = (
+            self.structured_retriever.get_routing_context(user)
+            if user.is_authenticated()
+            else {}
+        )
+        route = self.llm_service.analyze_query(
+            history,
+            request.query,
+            user,
+            routing_context,
+        )
+        query = route.rewritten_query or request.query
+
+        if route.intent == "clarification":
+            if QueryIntentRouter.has_schedule_time_constraint(request.query):
+                answer = "请补充一下你想查询这段时间的课程安排，还是想了解某一节课的作用。"
+            else:
+                answer = "请补充一下你想查询学院的哪方面信息，例如所属学院、学院历史、通知或专业设置。"
+            self.history_mgr.append_ai_message(request.session_id, answer)
+            self._last_response_metadata = self._build_response_metadata(
+                docs=[],
+                answer_origin="system",
+            )
+            yield answer
+            return
+
+        if route.intent == "procedure" and self._can_attempt_faq(route.intent, request.query):
+            local_faq = self.local_faq_retriever.match(request.query)
+            if local_faq:
+                answer = f"【FAQ标准回答】\n{local_faq.metadata['answer']}"
+                self.history_mgr.append_ai_message(request.session_id, answer)
+                self._set_direct_metadata(local_faq, answer_origin="faq")
+                yield answer
+                return
+
+        if user.is_authenticated() and route.intent == "personal_fact":
+            if (
+                route.personal_field == "schedule"
+                and route.personal_action == "explain_course"
+            ):
+                matches = self.structured_retriever.resolve_schedule_reference(
+                    request.query,
+                    user,
+                    personal_filters=route.personal_filters,
+                    allow_rule_fallback=not route.used_llm,
+                )
+                if len(matches) == 1:
+                    yield from self._explain_resolved_course(
+                        request.query,
+                        matches[0],
+                        request.session_id,
+                    )
+                    return
+                if not matches:
+                    answer = "我没有在你的课表中定位到这节课，请补充具体星期和上课时间。"
+                else:
+                    course_names = "、".join(item.course_name for item in matches[:4])
+                    answer = f"这段时间匹配到多节课：{course_names}。请说明你想了解哪一节课。"
+                self.history_mgr.append_ai_message(request.session_id, answer)
+                self._last_response_metadata = self._build_response_metadata(
+                    docs=[],
+                    answer_origin="system",
+                )
+                yield answer
+                return
+
+            # Exact personal facts must not depend on query rewriting or the
+            # availability of an external LLM service.
+            direct_answer = self.structured_retriever.answer_personal_query(
+                request.query,
+                user,
+                personal_field=route.personal_field,
+                personal_action=route.personal_action,
+                personal_filters=route.personal_filters,
+                allow_rule_fallback=not route.used_llm,
+            )
+            if direct_answer:
+                self.history_mgr.append_ai_message(request.session_id, direct_answer)
+                self._last_response_metadata = self._build_response_metadata(
+                    docs=[
+                        Document(
+                            id="structured-personal-direct",
+                            content=direct_answer,
+                            score=1.0,
+                            source="MySQL个人档案",
+                            metadata={"record_type": "profile"},
+                        )
+                    ],
+                    answer_origin="personal",
+                )
+                yield direct_answer
+                return
+
+            structured_docs = self._filter_structured_personal_docs(
+                request.query,
+                self.structured_retriever.get_personal_documents(user),
+            )
+            vector_docs = self.retriever.search(
+                request.query,
+                [settings.COLLECTION_PERSONAL],
+                top_k=5,
+                filters=f"user_id == '{user.user_id}'",
+            )
+            vector_docs = [
+                doc
+                for doc in vector_docs
+                if self._is_relevant(
+                    request.query,
+                    doc,
+                    self.PERSONAL_VECTOR_THRESHOLD,
+                )
+            ]
+            personal_docs = self._keyword_rerank(
+                request.query,
+                structured_docs + vector_docs,
+                final_k=5,
+            )
+            if personal_docs:
+                yield from self._generate_and_record(
+                    request.query,
+                    personal_docs,
+                    self._personal_prompt(),
+                    request.session_id,
+                )
+                return
+
+        if self._can_attempt_faq(route.intent, request.query):
+            local_faq = self.local_faq_retriever.match(request.query)
+            if local_faq:
+                answer = f"【FAQ标准回答】\n{local_faq.metadata['answer']}"
+                self.history_mgr.append_ai_message(request.session_id, answer)
+                self._set_direct_metadata(local_faq, answer_origin="faq")
+                yield answer
+                return
+
+        if route.intent == "procedure" and self._can_attempt_faq(route.intent, query):
+            faq_results = self.retriever.search(
+                query,
+                [settings.COLLECTION_FAQ],
+                top_k=1,
+            )
+            if faq_results and faq_results[0].score >= self.FAQ_THRESHOLD:
+                answer = faq_results[0].metadata.get("answer")
+                if answer:
+                    final_answer = f"【官方回答】\n{answer}"
+                    self.history_mgr.append_ai_message(
+                        request.session_id,
+                        final_answer,
+                    )
+                    self._set_direct_metadata(
+                        faq_results[0],
+                        answer_origin="faq",
+                    )
+                    yield final_answer
+                    return
+
+        collections = [settings.COLLECTION_STANDARD]
+        candidates: List[Document] = []
+        if user.is_authenticated():
+            # ACADEMIC_URLS are stored in rag_knowledge and treated as campus
+            # internal crawled content in the unified product experience.
+            collections.append(settings.COLLECTION_KNOWLEDGE)
+            notice_docs = self.structured_retriever.get_notice_documents(user)
+            candidates.extend(self._filter_notices(query, notice_docs))
+
+        resolved_identity_entity = (
+            user.is_authenticated()
+            and route.intent == "campus_knowledge"
+            and query != request.query
+        )
+        search_collections = (
+            [settings.COLLECTION_KNOWLEDGE]
+            if resolved_identity_entity
+            else collections
+        )
+        campus_docs = self.retriever.search(
+            query,
+            search_collections,
+            top_k=20,
+        )
+        relevant_campus_docs = [
+            doc
+            for doc in campus_docs
+            if self._is_relevant(query, doc, self.CAMPUS_VECTOR_THRESHOLD)
+        ]
+        if resolved_identity_entity and not relevant_campus_docs:
+            public_docs = self.retriever.search(
+                query,
+                [settings.COLLECTION_STANDARD],
+                top_k=20,
+            )
+            relevant_campus_docs = [
+                doc
+                for doc in public_docs
+                if self._is_relevant(
+                    query,
+                    doc,
+                    self.CAMPUS_VECTOR_THRESHOLD,
+                )
+            ]
+        candidates.extend(relevant_campus_docs)
+        docs = self._keyword_rerank(query, candidates, final_k=6)
+
+        if docs:
+            prompt = self._campus_prompt()
+        else:
+            prompt = self._fallback_prompt()
+
+        yield from self._generate_and_record(
+            query,
+            docs,
+            prompt,
+            request.session_id,
+        )
+
+    def _explain_resolved_course(
+        self,
+        original_query: str,
+        course,
+        session_id: str,
+    ) -> Generator[str, None, None]:
+        weekday_names = {
+            1: "周一",
+            2: "周二",
+            3: "周三",
+            4: "周四",
+            5: "周五",
+            6: "周六",
+            7: "周日",
+        }
+        schedule_text = weekday_names.get(course.weekday, "日期待补充")
+        if course.start_time and course.end_time:
+            schedule_text += (
+                f" {course.start_time.strftime('%H:%M')}-"
+                f"{course.end_time.strftime('%H:%M')}"
+            )
+        prompt = """你是一个课程概念解释助手。用户先通过自己的课表定位到一门课，随后询问这门课的作用、用途或它是干什么的。
+课表只用于确定课程名称，不提供课程解释内容。请基于通用知识解释这门课程通常学习什么、有什么作用、能用来做什么。
+如果课程名称过于宽泛，请说明这是一般性解释。
+
+【已定位课程】
+课程名称：{context}
+
+【用户问题】
+{question}
+
+【回答】"""
+        query = (
+            f"用户课表中 {schedule_text} 的课程是“{course.course_name}”。"
+            f"请回答：{original_query}"
+        )
+        full_answer = ""
+        try:
+            for chunk in self.llm_service.generate_answer(
+                query,
+                [
+                    Document(
+                        id=f"schedule-course-{course.id}",
+                        content=course.course_name,
+                        score=1.0,
+                        source=f"MySQL个人课表｜{schedule_text}",
+                        metadata={"record_type": "schedule"},
+                    )
+                ],
+                prompt,
+            ):
+                full_answer += chunk
+                yield chunk
+        except Exception:
+            logger.exception("Course explanation generation failed")
+            full_answer = SERVICE_UNAVAILABLE_MESSAGE
+            yield full_answer
+        self.history_mgr.append_ai_message(session_id, full_answer)
+        self._last_response_metadata = {
+            "answer_origin": "llm",
+            "confidence": "low",
+            "notice": "已用个人课表定位课程名称，课程作用说明由大模型基于通用知识生成。",
+            "sources": [
+                {
+                    "title": "MySQL个人课表",
+                    "url": None,
+                    "snippet": f"{schedule_text}，{course.course_name}",
+                    "score": 1.0,
+                    "source_type": "personal",
+                }
+            ],
+        }
+
+    @staticmethod
+    def _filter_structured_personal_docs(
+        query: str,
+        docs: List[Document],
+    ) -> List[Document]:
+        keywords = {
+            word.strip()
+            for word in jieba.lcut_for_search(query)
+            if len(word.strip()) > 1
+            and word.strip() not in {"我的", "本人", "个人", "当前", "查询", "查看"}
+        }
+        if any(word in query for word in ("个人信息", "个人档案", "我的信息", "我的档案")):
+            return [
+                doc
+                for doc in docs
+                if doc.metadata.get("record_type") == "profile"
+            ]
+        return [
+            doc
+            for doc in docs
+            if any(keyword in doc.content for keyword in keywords)
+        ]
+
+    def _generate_and_record(
+        self,
+        query: str,
+        docs: List[Document],
+        prompt: str,
+        session_id: str,
+    ) -> Generator[str, None, None]:
+        full_answer = ""
+        try:
+            for chunk in self.llm_service.generate_answer(query, docs, prompt):
+                full_answer += chunk
+                yield chunk
+        except Exception:
+            logger.exception("Auto answer generation failed")
+            if docs:
+                full_answer = self._format_document_fallback(query, docs)
+            else:
+                full_answer = SERVICE_UNAVAILABLE_MESSAGE
+            yield full_answer
+        self.history_mgr.append_ai_message(session_id, full_answer)
+        self._last_response_metadata = self._build_response_metadata(
+            docs=docs,
+            answer_origin="rag" if docs else "llm",
+        )
+
+    @staticmethod
+    def _format_document_fallback(
+        query: str,
+        docs: List[Document],
+    ) -> str:
+        lines = ["已从现有数据库检索到以下相关资料："]
+        keywords = {
+            word.strip()
+            for word in jieba.lcut_for_search(query)
+            if len(word.strip()) > 1
+            and word.strip()
+            not in {
+                "同济大学",
+                "哪一年",
+                "什么",
+                "我的",
+                "所在",
+                "所属",
+                "目前",
+                "当前",
+            }
+        }
+        candidates = []
+        for doc in docs:
+            segments = re.split(r"(?<=[。！？；])|\n+", doc.content)
+            for segment in segments:
+                content = " ".join(segment.split()).strip()
+                if len(content) < 8:
+                    continue
+                matched = sum(keyword in content for keyword in keywords)
+                score = matched
+                if "成立" in query and "成立" in content:
+                    score += 3
+                if re.search(r"(?:19|20)\d{2}年", content):
+                    score += 1
+                if "计算机科学与技术学院" in query and (
+                    "计算机科学与技术学院" in content
+                ):
+                    score += 4
+                candidates.append((score, content, doc.source))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        selected = []
+        seen = set()
+        best_score = candidates[0][0] if candidates else 0
+        for score, content, source in candidates:
+            signature = (content, source)
+            if (
+                score <= 0
+                or score < best_score - 1
+                or signature in seen
+            ):
+                continue
+            seen.add(signature)
+            selected.append((content, source))
+            if len(selected) == 2:
+                break
+
+        if not selected:
+            selected = [
+                (" ".join(docs[0].content.split())[:500], docs[0].source)
+            ]
+
+        for content, source in selected:
+            if len(content) > 500:
+                content = content[:500] + "..."
+            source = source or "校园资料库"
+            lines.append(f"- {content}（来源：{source}）")
+        lines.append("当前大模型服务不可用，以上为数据库原始资料摘要。")
+        return "\n".join(lines)
+
+    def _retrieve_strategy(self, query: str, user: UserContext) -> List[Document]:
+        return []
+
+    def _get_prompt_template(self) -> str:
+        return self._campus_prompt()
+
+    @staticmethod
+    def _personal_prompt() -> str:
+        return """你是个人信息查询助手。参考资料仅属于当前登录用户。
+请优先、准确、简洁地回答用户问题，数字和时间必须保持原值。
+不要泄露无关个人信息，不要使用资料之外的内容。
+
+【当前用户个人资料】
+{context}
+
+【问题】
+{question}
+
+【回答】
+"""
+
+    @staticmethod
+    def _campus_prompt() -> str:
+        return """你是同济大学校园问答助手。请只依据检索到的校园资料回答。
+资料来源优先级为：当前用户可见的校内通知，其次是公开及校内爬取内容。
+直接回答问题，保留原始日期、时间、地点和数值；资料不足时明确说明不足，
+不要编造学校规定、联系方式或个人信息。
+
+【校园资料】
+{context}
+
+【问题】
+{question}
+
+【回答】
+"""
+
+    @staticmethod
+    def _fallback_prompt() -> str:
+        return """你是一个通用智能助手。校园个人库、通知库和爬取资料中没有找到
+可用于回答当前问题的内容，因此请使用通用知识回答。不得声称答案来自同济大学
+数据库或官方文件；涉及校内实时规定、个人数据或不确定事实时，应明确提示用户
+需要以学校官方信息为准。
+
+【问题】
+{question}
+
+【回答】
+"""
+
+
 class PublicPipeline(BasePipeline):
     # 官方问答命中阈值
     FAQ_THRESHOLD = 0.8
 
     def execute(self, request: RequestPayload, user: UserContext) -> Generator[str, None, None]:
+        self._reset_metadata()
         # 记录上下文 查询重写
         history = self.history_mgr.get_recent_turns(request.session_id)
-        rewritten_query = self.llm_service.rewrite_query(history, request.query)
         self.history_mgr.append_user_message(request.session_id, request.query)
+
+        llm_only_query = self._extract_llm_only_query(request.query)
+        if llm_only_query:
+            yield from self._answer_with_llm_only(
+                llm_only_query,
+                request.session_id,
+            )
+            return
+
+        local_faq = self.local_faq_retriever.match(request.query)
+        if local_faq:
+            final_output = f"【FAQ标准回答】\n{local_faq.metadata['answer']}"
+            yield final_output
+            self.history_mgr.append_ai_message(request.session_id, final_output)
+            self._set_direct_metadata(local_faq, answer_origin="faq")
+            return
+
+        llm_only_query = self._extract_llm_only_query(request.query)
+        if llm_only_query:
+            self.history_mgr.append_user_message(request.session_id, request.query)
+            yield from self._answer_with_llm_only(
+                llm_only_query,
+                request.session_id,
+            )
+            return
+
+        rewritten_query = self.llm_service.rewrite_query(history, request.query)
         
         # 第一步：检索官方 FAQ 库
-        faq_results = self.retriever.search(
-            rewritten_query.rewritten_text, 
-            [settings.COLLECTION_FAQ], # 只搜 rag_faq
-            top_k=1
+        faq_results = (
+            self.retriever.search(
+                rewritten_query.rewritten_text,
+                [settings.COLLECTION_FAQ],
+                top_k=1,
+            )
+            if LocalFAQRetriever.is_specific_faq_query(rewritten_query.rewritten_text)
+            else []
         )
         
         # 判断是否命中
@@ -139,6 +890,7 @@ class PublicPipeline(BasePipeline):
                 # 直接返回，不调 LLM
                 yield final_output
                 self.history_mgr.append_ai_message(request.session_id, final_output)
+                self._set_direct_metadata(faq_results[0], answer_origin="faq")
                 return 
 
         # RAG 流程
@@ -151,10 +903,15 @@ class PublicPipeline(BasePipeline):
                 full_answer += chunk
                 yield chunk
         except Exception as e:
-            err = f"Error: {str(e)}"
+            logger.exception("Public answer generation failed")
+            err = SERVICE_UNAVAILABLE_MESSAGE
             yield err
             full_answer += err
         self.history_mgr.append_ai_message(request.session_id, full_answer)
+        self._last_response_metadata = self._build_response_metadata(
+            docs=docs,
+            answer_origin="rag" if docs else "llm",
+        )
 
     def _retrieve_strategy(self, query: str, user: UserContext) -> List[Document]:
         # 策略修改：
@@ -188,7 +945,7 @@ class PublicPipeline(BasePipeline):
         【你的回答】
         """
 
-class ScholarPipeline(BasePipeline):
+class AcademicPipeline(BasePipeline):
     def _retrieve_strategy(self, query: str, user: UserContext) -> List[Document]:
         # 学术场景：召回更多候选，混合排序
         candidates = self.retriever.search(
@@ -229,14 +986,10 @@ class ScholarPipeline(BasePipeline):
 class InternalPipeline(BasePipeline):
     def _retrieve_strategy(self, query: str, user: UserContext) -> List[Document]:
         # 内部场景策略：
-        if not user.dept_id:
-            filter_expr = "dept_id == 'unknown'" 
-        else:
-            filter_expr = f"dept_id == '{user.dept_id}'"
         
         # 扩大初筛范围 (Recall Phase)
         docs_public = self.retriever.search(query, [settings.COLLECTION_STANDARD, settings.COLLECTION_KNOWLEDGE], top_k=10)
-        docs_internal = self.retriever.search(query, [settings.COLLECTION_INTERNAL], top_k=10, filters=filter_expr)
+        docs_internal = self.structured_retriever.get_notice_documents(user)
         
         # 合并
         all_candidates = docs_public + docs_internal
@@ -273,6 +1026,7 @@ class PersonalPipeline(BasePipeline):
             top_k=10, 
             filters=f"user_id == '{user.user_id}'"
         )
+        candidates.extend(self.structured_retriever.get_personal_documents(user))
         return self._keyword_rerank(query, candidates, final_k=5)
 
     def _get_prompt_template(self) -> str:

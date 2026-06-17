@@ -34,43 +34,47 @@ watch(
 );
 
 const themeStyles = computed(() => ({
-  sidebarBg: 'bg-slate-900',
+  sidebarBg: 'bg-[#111827]',
   avatarBg:
     props.themeColor === 'green'
-      ? 'bg-green-600'
+      ? 'bg-emerald-500'
       : props.themeColor === 'purple'
-        ? 'bg-purple-600'
-        : 'bg-blue-600',
+        ? 'bg-violet-500'
+        : props.themeColor === 'orange'
+          ? 'bg-amber-500'
+          : 'bg-cyan-600',
   botMsgBg:
     props.themeColor === 'green'
-      ? 'bg-green-600'
+      ? 'bg-emerald-500'
       : props.themeColor === 'purple'
-        ? 'bg-purple-600'
-        : 'bg-blue-600',
+        ? 'bg-violet-500'
+        : props.themeColor === 'orange'
+          ? 'bg-amber-500'
+          : 'bg-cyan-600',
   headerBadgeBorder:
     props.themeColor === 'green'
       ? 'border-green-100'
       : props.themeColor === 'purple'
         ? 'border-purple-100'
-        : 'border-blue-100',
+        : 'border-cyan-100',
   headerBadgeBg:
     props.themeColor === 'green'
       ? 'bg-green-50'
       : props.themeColor === 'purple'
         ? 'bg-purple-50'
-        : 'bg-blue-50',
+        : 'bg-cyan-50',
   headerBadgeText:
     props.themeColor === 'green'
       ? 'text-green-700'
       : props.themeColor === 'purple'
         ? 'text-purple-700'
-        : 'text-blue-700',
+        : 'text-cyan-800',
   headerBadgeDot:
     props.themeColor === 'green'
       ? 'bg-green-500'
       : props.themeColor === 'purple'
         ? 'bg-purple-500'
-        : 'bg-blue-500'
+        : 'bg-cyan-500'
 }));
 
 const handleSend = () => {
@@ -83,8 +87,30 @@ const handleExampleClick = (question) => {
   emit('send-message', question);
 };
 
-const formatContent = (html) =>
-  html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+const formatContent = (content = '') => {
+  const escaped = content
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+  return escaped.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replaceAll('\n', '<br>');
+};
+
+const confidenceLabel = (value) => {
+  const map = {
+    high: '置信度高',
+    medium: '置信度中',
+    low: '资料不足'
+  };
+  return map[value] || '来源提示';
+};
+
+const confidenceClass = (value) => {
+  if (value === 'high') return 'bg-emerald-50 text-emerald-700 border-emerald-100';
+  if (value === 'medium') return 'bg-amber-50 text-amber-700 border-amber-100';
+  return 'bg-slate-50 text-slate-600 border-slate-200';
+};
 
 const showWelcome = computed(() => {
   // 只有当完全没有消息时才显示欢迎页面
@@ -93,14 +119,17 @@ const showWelcome = computed(() => {
 </script>
 
 <template>
-  <div class="flex h-full bg-gray-50 font-sans text-slate-800 overflow-hidden relative">
+  <div class="flex h-full bg-[#eef3f4] font-sans text-slate-800 overflow-hidden relative">
     <div
       :class="`${sidebarOpen ? 'w-64' : 'w-0'} ${themeStyles.sidebarBg} text-white transition-all duration-300 flex flex-col overflow-hidden shadow-xl z-20`"
     >
-      <div class="p-5 border-b border-slate-700 flex items-center justify-between">
-        <div class="flex items-center gap-2 font-bold text-lg text-blue-400">
-          <div class="w-8 h-8 rounded bg-blue-600 flex items-center justify-center text-white">S</div>
-          SynapseQ
+      <div class="p-5 border-b border-white/10 flex items-center justify-between">
+        <div class="flex items-center gap-3 font-semibold text-lg text-white tracking-wide">
+          <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-400 to-emerald-400 flex items-center justify-center text-slate-950 font-black shadow-lg shadow-cyan-950/30">S</div>
+          <div>
+            <div>SynapseQ</div>
+            <div class="text-[10px] font-normal tracking-[0.18em] text-slate-400">TONGJI CAMPUS AI</div>
+          </div>
         </div>
       </div>
 
@@ -108,7 +137,7 @@ const showWelcome = computed(() => {
         <div class="px-4 mb-3">
           <button
             @click="emit('new-conversation')"
-            class="w-full px-3 py-2 rounded-md bg-slate-800 hover:bg-slate-700 text-white text-sm font-medium flex items-center gap-2 transition-colors border border-slate-700"
+            class="w-full px-3 py-2.5 rounded-xl bg-cyan-400/10 hover:bg-cyan-400/15 text-cyan-100 text-sm font-medium flex items-center gap-2 transition-colors border border-cyan-300/20"
           >
             <Plus size="16" />
             新建对话
@@ -128,8 +157,8 @@ const showWelcome = computed(() => {
               class="w-full text-left px-3 py-2.5 rounded-md flex items-center gap-3 transition-colors relative"
               :class="
                 currentConversationId === conversation.id
-                  ? 'bg-slate-800 text-white shadow-sm border-l-2 border-blue-500'
-                  : 'text-slate-400 hover:bg-slate-800 hover:text-white'
+                  ? 'bg-white/10 text-white shadow-sm border-l-2 border-cyan-400'
+                  : 'text-slate-400 hover:bg-white/5 hover:text-white'
               "
             >
               <MessageSquare class="w-4 h-4 flex-shrink-0" />
@@ -150,7 +179,7 @@ const showWelcome = computed(() => {
         </nav>
       </div>
 
-      <div class="p-4 border-t border-slate-700 bg-slate-900">
+      <div class="p-4 border-t border-white/10 bg-black/10">
         <div class="flex items-center gap-3 mb-3">
           <div
             :class="`w-10 h-10 rounded-full ${themeStyles.avatarBg} flex items-center justify-center text-sm font-bold shadow-lg`"
@@ -166,7 +195,7 @@ const showWelcome = computed(() => {
         </div>
         <button
           @click="emit('logout')"
-          class="w-full px-3 py-2 rounded-md text-slate-300 hover:text-white hover:bg-slate-800 text-sm font-medium flex items-center justify-center gap-2 transition-colors border border-slate-700"
+          class="w-full px-3 py-2 rounded-xl text-slate-300 hover:text-white hover:bg-white/5 text-sm font-medium flex items-center justify-center gap-2 transition-colors border border-white/10"
         >
           <LogOut size="16" />
           退出登录
@@ -175,7 +204,7 @@ const showWelcome = computed(() => {
     </div>
 
     <div class="flex-1 flex flex-col min-w-0 bg-white shadow-sm relative z-10">
-      <header class="h-16 border-b flex items-center justify-between px-6 bg-white z-10">
+      <header class="h-16 border-b border-slate-200/80 flex items-center justify-between px-6 bg-white/95 backdrop-blur z-10">
         <div class="flex items-center gap-4">
           <button
             @click="sidebarOpen = !sidebarOpen"
@@ -205,14 +234,14 @@ const showWelcome = computed(() => {
         </div>
       </header>
 
-      <div class="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 bg-slate-50 scroll-smooth relative">
+      <div class="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 bg-[radial-gradient(circle_at_top_left,_#e2f6f4_0,_#f7faf9_38%,_#eef3f4_100%)] scroll-smooth relative">
         <!-- Welcome Page -->
         <div v-if="showWelcome" class="flex items-center justify-center min-h-[calc(100%-4rem)]">
           <div class="max-w-3xl w-full text-center space-y-8 py-12">
             <div class="space-y-4">
               <div class="flex justify-center">
                 <div
-                  class="w-16 h-16 rounded-full flex items-center justify-center text-2xl font-bold shadow-lg"
+                  class="w-16 h-16 rounded-2xl flex items-center justify-center text-2xl font-bold shadow-xl rotate-3"
                   :class="`${themeStyles.botMsgBg} text-white`"
                 >
                   AI
@@ -251,7 +280,7 @@ const showWelcome = computed(() => {
 
               <div class="space-y-2">
                 <div
-                  class="p-4 rounded-2xl shadow-sm text-sm leading-relaxed bg-white text-gray-800 border border-gray-100"
+                  class="p-4 rounded-2xl shadow-sm text-sm leading-relaxed bg-white/95 text-gray-800 border border-white"
                   :class="msg.sender === 'user' ? 'rounded-tr-none' : 'rounded-tl-none'"
                 >
                   <div v-html="formatContent(msg.content)" />
@@ -269,6 +298,48 @@ const showWelcome = computed(() => {
                     <span class="underline decoration-dotted">{{ src.title }}</span>
                   </div>
                 </div>
+
+                <div
+                  v-if="msg.metadata"
+                  class="rounded-lg border bg-white/90 shadow-sm overflow-hidden"
+                  :class="confidenceClass(msg.metadata.confidence)"
+                >
+                  <div class="px-3 py-2 text-xs flex items-center justify-between gap-3">
+                    <span class="font-semibold">{{ confidenceLabel(msg.metadata.confidence) }}</span>
+                    <span class="text-right opacity-80">{{ msg.metadata.notice }}</span>
+                  </div>
+                  <details v-if="msg.metadata.sources?.length" class="border-t border-current/10 bg-white text-slate-700">
+                    <summary class="px-3 py-2 text-xs font-semibold cursor-pointer select-none">
+                      查看资料来源与原文片段
+                    </summary>
+                    <div class="px-3 pb-3 space-y-2">
+                      <div
+                        v-for="(source, idx) in msg.metadata.sources"
+                        :key="`${source.title}-${idx}`"
+                        class="rounded-md border border-slate-100 bg-slate-50 p-3 text-xs"
+                      >
+                        <div class="flex items-center justify-between gap-3 mb-1">
+                          <a
+                            v-if="source.url"
+                            :href="source.url"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            class="font-semibold text-cyan-700 hover:underline truncate"
+                          >
+                            {{ source.title || '原文链接' }}
+                          </a>
+                          <span v-else class="font-semibold text-slate-700 truncate">
+                            {{ source.title || '资料库来源' }}
+                          </span>
+                          <span class="shrink-0 rounded bg-white px-2 py-0.5 text-[11px] text-slate-500 border">
+                            {{ source.source_type }}
+                          </span>
+                        </div>
+                        <p class="leading-relaxed text-slate-600">{{ source.snippet }}</p>
+                      </div>
+                    </div>
+                  </details>
+                </div>
               </div>
             </div>
           </div>
@@ -276,18 +347,18 @@ const showWelcome = computed(() => {
         </template>
       </div>
 
-      <div class="p-4 bg-white border-t">
+      <div class="p-4 bg-white border-t border-slate-200">
         <div class="max-w-4xl mx-auto relative">
           <textarea
             v-model="inputText"
             @keydown.enter.prevent="!$event.shiftKey && handleSend()"
             placeholder="向 SynapseQ 提问..."
-            class="w-full pl-4 pr-14 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 resize-none text-sm shadow-inner"
+            class="w-full pl-4 pr-14 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-cyan-500/20 focus:border-cyan-500 resize-none text-sm shadow-inner"
             rows="1"
           />
           <button
             @click="handleSend"
-            class="absolute right-2 top-2 p-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors shadow-md disabled:opacity-50"
+            class="absolute right-2 top-2 p-1.5 bg-cyan-700 text-white rounded-xl hover:bg-cyan-800 transition-colors shadow-md disabled:opacity-50"
             :disabled="!inputText.trim()"
           >
             <svg viewBox="0 0 24 24" class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -300,9 +371,9 @@ const showWelcome = computed(() => {
     </div>
 
     <div
-      :class="`${rightPanelOpen ? 'w-80' : 'w-0'} bg-white border-l border-gray-200 transition-all duration-300 overflow-hidden flex flex-col shadow-lg z-10`"
+      :class="`${rightPanelOpen ? 'w-80' : 'w-0'} bg-[#f8faf9] border-l border-slate-200 transition-all duration-300 overflow-hidden flex flex-col shadow-lg z-10`"
     >
-      <div class="p-5 border-b bg-gray-50 flex justify-between items-center">
+      <div class="p-5 border-b bg-white flex justify-between items-center">
         <h3 class="font-semibold text-gray-700 flex items-center gap-2">
           <Database size="18" class="text-slate-500" /> 信息面板
         </h3>
@@ -315,8 +386,8 @@ const showWelcome = computed(() => {
           <div class="text-sm text-gray-500">右侧内容未提供</div>
         </slot>
       </div>
-      <div class="p-4 border-t bg-gray-50 text-xs text-gray-500 flex justify-between items-center">
-        <span>Latency: 28ms</span>
+      <div class="p-4 border-t bg-white text-xs text-gray-500 flex justify-between items-center">
+        <span>RAG Services</span>
         <span class="flex items-center gap-1 text-green-600 font-medium">
           <div class="w-1.5 h-1.5 rounded-full bg-green-500" />
           Online

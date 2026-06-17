@@ -28,6 +28,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 3. 复制项目源代码和脚本
 COPY app/ ./app/
 COPY scripts/ ./scripts/
+COPY tests/ ./tests/
 
 # 暴露 FastAPI 端口
 EXPOSE 8000

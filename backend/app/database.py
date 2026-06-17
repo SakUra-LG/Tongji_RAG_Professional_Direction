@@ -7,7 +7,7 @@ SQLALCHEMY_DATABASE_URL = (
     f"@{settings.MYSQL_HOST}:{settings.MYSQL_PORT}/{settings.MYSQL_DATABASE}"
 )
 
-engine = create_async_engine(SQLALCHEMY_DATABASE_URL, echo=False, pool_pre_ping=True)
+engine = create_async_engine(SQLALCHEMY_DATABASE_URL, echo=False)
 AsyncSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False, autoflush=False)
 Base = declarative_base()
 

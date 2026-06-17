@@ -20,6 +20,7 @@ import {
   ChevronRight
 } from 'lucide-vue-next';
 import SynapseQShell from './components/SynapseQShell.vue';
+import AdminPanel from './components/AdminPanel.vue';
 import { authAPI, sessionAPI, chatAPI, getUserInfo, isAuthenticated } from './api/api.js';
 
 const showLogin = ref(true);
@@ -27,14 +28,22 @@ const loggingIn = ref(false);
 const loginError = ref('');
 const loginForm = ref({ email: '', password: '' });
 const rememberLogin = ref(false);
-const rememberPassword = ref(false);
 
-const currentMode = ref('visitor'); // visitor | scholar | student | denied
+const currentMode = ref('visitor'); // visitor | student | denied
 const currentUserInfo = ref(null); // 存储当前登录用户信息
+const showAdminPanel = ref(false);
 
-// Type管理系统
-const currentType = ref('public'); // 当前选择的type: public | academic | internal | personal
+// 单一自动问答入口，后端根据身份决定可检索的数据范围
+const currentType = ref('auto');
 const typeConfig = {
+  auto: {
+    label: '智能问答',
+    description: '自动检索授权数据',
+    icon: Sparkles,
+    color: 'blue',
+    badge: '身份检索已连接',
+    title: 'SynapseQ 智能问答'
+  },
   public: {
     label: '公开',
     description: '校务公开/FAQ',
@@ -71,36 +80,16 @@ const typeConfig = {
 
 // 根据用户角色获取可用的type列表
 const getAvailableTypes = (role) => {
-  const roleLower = (role || '').toLowerCase();
-  const types = ['public']; // 所有人都可以访问public
-  
-  if (roleLower.includes('scholar') || roleLower.includes('visiting') || 
-      roleLower.includes('student') || roleLower.includes('teacher')) {
-    types.push('academic');
-  }
-  
-  if (roleLower.includes('student') || roleLower.includes('teacher')) {
-    types.push('internal', 'personal');
-  }
-  
-  return types;
+  return ['auto'];
 };
 
 // 统一的会话和消息存储（按type管理）
 const typeSessions = ref({
+  auto: { conversations: [], currentId: '', messages: [] },
   public: { conversations: [], currentId: '', messages: [] },
   academic: { conversations: [], currentId: '', messages: [] },
   internal: { conversations: [], currentId: '', messages: [] },
   personal: { conversations: [], currentId: '', messages: [] }
-});
-
-// 当前可用type列表
-const availableTypes = computed(() => {
-  if (!currentUserInfo.value) {
-    return ['public']; // 未登录只能访问public
-  }
-  const role = currentUserInfo.value.role || '';
-  return getAvailableTypes(role);
 });
 
 // 当前type的会话和消息（计算属性）
@@ -144,8 +133,20 @@ const currentTypeConfig = computed(() => {
   return typeConfig[currentType.value] || typeConfig.public;
 });
 
+const isAdminUser = computed(() => {
+  const rawRole = (currentUserInfo.value?.role || '').toLowerCase();
+  const displayRole = (currentUser.value?.role || '').toLowerCase();
+  return rawRole.includes('admin') || displayRole.includes('admin') || currentMode.value === 'admin';
+});
+
 // 辅助函数：获取示例问题
 const getExampleQuestions = (type) => {
+  if (type === 'auto') {
+    if (currentMode.value === 'student') {
+      return ['我的绩点是多少？', '查看我的课程表', '我属于哪个学院？', '最近有什么校内通知？'];
+    }
+    return ['同济大学的校训是什么？', '同济大学创建于哪一年？', '嘉定校区地址在哪里？', '介绍一下同济大学'];
+  }
   const questions = {
     public: ['嘉定校区图书馆在哪里？', '四平路校区地图', '校车时刻表(仅公开版)', '2025本科招生简章'],
     academic: ['汽车学院在自动驾驶领域最近有什么发表？', '查找IEEE关于机器学习的论文', 'CNKI中关于人工智能的最新研究', '同济大学2024年科研年报'],
@@ -168,9 +169,10 @@ const getPopularQuestions = (type) => {
 
 // 辅助函数：获取欢迎标题
 const getWelcomeTitle = (type) => {
-  if (type === 'personal' || type === 'internal') {
+  if (type === 'auto' && currentMode.value === 'student') {
     return `欢迎回来，${currentUser.value.name}！`;
   }
+  if (type === 'auto') return '欢迎使用 SynapseQ';
   return `欢迎使用 SynapseQ ${typeConfig[type]?.label || ''}`;
 };
 
@@ -265,9 +267,7 @@ const getUserPanelGradientClass = () => {
   
   const role = (currentUserInfo.value.role || '').toLowerCase();
   
-  if (role.includes('scholar') || role.includes('visiting')) {
-    return 'bg-gradient-to-br from-purple-500 to-pink-600 rounded-xl p-4 text-white shadow-lg relative overflow-hidden';
-  } else if (role.includes('student') || role.includes('teacher')) {
+  if (role.includes('student') || role.includes('teacher')) {
     return 'bg-gradient-to-br from-blue-500 to-indigo-600 rounded-xl p-4 text-white shadow-lg relative overflow-hidden';
   } else {
     return 'bg-gradient-to-br from-green-500 to-emerald-600 rounded-xl p-4 text-white shadow-lg relative overflow-hidden';
@@ -276,20 +276,26 @@ const getUserPanelGradientClass = () => {
 
 // 根据用户角色获取连接的集合（而不是根据type）
 const getUserConnectedCollections = () => {
-  if (!currentUserInfo.value) {
+  const role = (
+    currentUserInfo.value?.role
+    || currentUser.value?.role
+    || ''
+  ).toLowerCase();
+  if (!currentUserInfo.value || role.includes('guest')) {
     return [{ name: 'Standard (公开)', color: 'green', access: 'Read' }];
   }
-  
-  const role = (currentUserInfo.value.role || '').toLowerCase();
-  const collections = [{ name: 'Standard (公开)', color: 'green', access: 'Read' }];
-  
-  if (role.includes('scholar') || role.includes('visiting') || 
-      role.includes('student') || role.includes('teacher')) {
-    collections.push({ name: 'Knowledge (学术)', color: 'purple', access: 'Read' });
+  if (isAdminUser.value) {
+    return [
+      { name: 'Standard (公开)', color: 'green', access: 'Manage' },
+      { name: 'Knowledge (师生)', color: 'blue', access: 'Manage' },
+      { name: 'FAQ', color: 'orange', access: 'Edit' }
+    ];
   }
   
+  const collections = [{ name: 'Standard (公开)', color: 'green', access: 'Read' }];
+  
   if (role.includes('student') || role.includes('teacher')) {
-    collections.push({ name: 'Internal (内部)', color: 'blue', access: 'Read' });
+    collections.push({ name: 'Internal (校内爬取)', color: 'blue', access: 'Read' });
     collections.push({ name: 'Person_info (个人)', color: 'orange', access: 'Private' });
   }
   
@@ -304,12 +310,7 @@ const getUserCommonServices = () => {
   
   const role = (currentUserInfo.value.role || '').toLowerCase();
   
-  if (role.includes('scholar') || role.includes('visiting')) {
-    return [
-      { name: '学术知识库', url: 'https://ir.tongji.edu.cn/tongji/' },
-      { name: '同济大学图书馆', url: 'https://www.lib.tongji.edu.cn/' }
-    ];
-  } else if (role.includes('student') || role.includes('teacher')) {
+  if (role.includes('student') || role.includes('teacher')) {
     return [
       { name: '教学信息管理系统', url: 'https://1.tongji.edu.cn/' },
       { name: 'canvas', url: 'https://canvas.tongji.edu.cn/' },
@@ -328,9 +329,7 @@ const getServiceLinkClass = () => {
   
   const role = (currentUserInfo.value.role || '').toLowerCase();
   
-  if (role.includes('scholar') || role.includes('visiting')) {
-    return 'w-full p-3 bg-white border border-purple-200 text-purple-700 rounded-lg text-xs cursor-pointer transition-colors flex items-center justify-between group text-left hover:bg-purple-50 hover:border-purple-300';
-  } else if (role.includes('student') || role.includes('teacher')) {
+  if (role.includes('student') || role.includes('teacher')) {
     return 'w-full p-3 bg-white border border-blue-200 text-blue-700 rounded-lg text-xs cursor-pointer transition-colors flex items-center justify-between group text-left hover:bg-blue-50 hover:border-blue-300';
   }
   
@@ -341,9 +340,11 @@ const getServiceLinkClass = () => {
 const getModeByRole = (role) => {
   const roleLower = (role || '').toLowerCase();
   // 根据角色映射到对应模式
-  if (roleLower.includes('scholar') || roleLower.includes('visiting')) {
-    return 'scholar';
-  } else if (roleLower.includes('student') || roleLower.includes('teacher') || roleLower.includes('teacher')) {
+  if (roleLower.includes('guest') || roleLower.includes('visitor')) {
+    return 'visitor';
+  } else if (roleLower.includes('admin')) {
+    return 'admin';
+  } else if (roleLower.includes('student') || roleLower.includes('teacher')) {
     return 'student';
   }
   // 默认返回student模式
@@ -521,6 +522,12 @@ const handleTypeSend = async (type, text) => {
       },
       () => {
         // 完成
+      },
+      (metadata) => {
+        const msg = typeSessions.value[type].messages.find(m => m.id === botMessageId);
+        if (msg) {
+          msg.metadata = metadata;
+        }
       }
     );
   } catch (error) {
@@ -528,49 +535,6 @@ const handleTypeSend = async (type, text) => {
     const msg = typeSessions.value[type].messages.find(m => m.id === botMessageId);
     if (msg) {
       msg.content = '抱歉，发生了错误: ' + error.message;
-    }
-  }
-};
-
-// 切换type
-const handleTypeChange = async (newType) => {
-  if (newType === currentType.value) return;
-  
-  try {
-    // 确保type存在
-    if (!typeSessions.value[newType]) {
-      typeSessions.value[newType] = { conversations: [], currentId: '', messages: [] };
-    }
-    
-    // 先切换type，让UI立即更新
-    currentType.value = newType;
-    
-    // 如果该type还没有加载会话，则加载
-    if (typeSessions.value[newType].conversations.length === 0) {
-      await loadTypeSessions(newType);
-    }
-    
-    // 如果有会话但当前没有选中，则选中第一个
-    if (typeSessions.value[newType].conversations.length > 0) {
-      if (!typeSessions.value[newType].currentId) {
-        typeSessions.value[newType].currentId = typeSessions.value[newType].conversations[0].id;
-      }
-      // 加载当前会话的历史
-      if (typeSessions.value[newType].currentId) {
-        await loadTypeHistory(newType, typeSessions.value[newType].currentId);
-      }
-    } else {
-      // 如果没有会话，创建新会话
-      await handleTypeNewConversation(newType);
-    }
-  } catch (error) {
-    console.error(`切换type到${newType}失败:`, error);
-    // 如果出错，确保至少有一个空的状态
-    if (!typeSessions.value[newType]) {
-      typeSessions.value[newType] = { conversations: [], currentId: '', messages: [] };
-    }
-    if (!typeSessions.value[newType].messages) {
-      typeSessions.value[newType].messages = [];
     }
   }
 };
@@ -727,147 +691,6 @@ const handleVisitorSend = async (text) => {
   } catch (error) {
     console.error('发送消息失败:', error);
     const msg = visitorMessages.value.find(m => m.id === botMessageId);
-    if (msg) {
-      msg.content = '抱歉，发生了错误: ' + error.message;
-    }
-  }
-};
-
-// Scholar
-const scholarConversations = ref([]);
-const currentScholarConversationId = ref('');
-const scholarMessages = ref([]);
-const scholarExampleQuestions = [
-  '汽车学院在自动驾驶领域最近有什么发表？',
-  '查找IEEE关于机器学习的论文',
-  'CNKI中关于人工智能的最新研究',
-  '同济大学2024年科研年报'
-];
-
-const loadScholarSessions = async () => {
-  try {
-    const response = await sessionAPI.getSessionList('academic');
-    scholarConversations.value = (response.data || []).map(session => ({
-      id: session.session_id,
-      title: session.title || '新对话',
-      time: formatDate(new Date(session.created_at)),
-      updatedAt: formatTime()
-    }));
-  } catch (error) {
-    console.error('加载会话列表失败:', error);
-  }
-};
-
-const loadScholarHistory = async (sessionId) => {
-  try {
-    const response = await sessionAPI.getSessionHistory(sessionId);
-    scholarMessages.value = (response.messages || []).map((msg, idx) => ({
-      id: idx + 1,
-      sender: msg.role === 'user' ? 'user' : 'bot',
-      timestamp: formatTime(new Date(msg.timestamp * 1000)),
-      content: msg.content
-    }));
-  } catch (error) {
-    console.error('加载历史失败:', error);
-  }
-};
-
-const handleScholarNewConversation = async () => {
-  try {
-    const response = await sessionAPI.createSession('academic');
-    const newSession = {
-      id: response.session_id,
-      title: response.title || '新对话',
-      time: formatDate(new Date(response.created_at)),
-      updatedAt: formatTime()
-    };
-    scholarConversations.value.unshift(newSession);
-    currentScholarConversationId.value = response.session_id;
-    scholarMessages.value = [];
-  } catch (error) {
-    console.error('创建会话失败:', error);
-    alert('创建会话失败: ' + error.message);
-  }
-};
-
-const handleScholarSwitchConversation = async (id) => {
-  currentScholarConversationId.value = id;
-  await loadScholarHistory(id);
-};
-
-const handleScholarDeleteConversation = async (id) => {
-  try {
-    await sessionAPI.deleteSession(id);
-    const index = scholarConversations.value.findIndex(c => c.id === id);
-    if (index !== -1) {
-      scholarConversations.value.splice(index, 1);
-      if (currentScholarConversationId.value === id) {
-        if (scholarConversations.value.length > 0) {
-          currentScholarConversationId.value = scholarConversations.value[0].id;
-          await loadScholarHistory(scholarConversations.value[0].id);
-        } else {
-          scholarMessages.value = [];
-          currentScholarConversationId.value = '';
-        }
-      }
-    }
-  } catch (error) {
-    console.error('删除会话失败:', error);
-    alert('删除会话失败: ' + error.message);
-  }
-};
-
-const handleScholarSend = async (text) => {
-  if (!currentScholarConversationId.value) {
-    await handleScholarNewConversation();
-  }
-  
-  const userMessage = {
-    id: scholarMessages.value.length + 1,
-    sender: 'user',
-    timestamp: formatTime(),
-    content: text
-  };
-  scholarMessages.value.push(userMessage);
-  
-  const conversation = scholarConversations.value.find(c => c.id === currentScholarConversationId.value);
-  if (conversation && conversation.title === '新对话') {
-    conversation.title = text.length > 20 ? text.substring(0, 20) + '...' : text;
-    conversation.updatedAt = formatTime();
-  }
-  
-  const botMessageId = scholarMessages.value.length + 1;
-  const botMessage = {
-    id: botMessageId,
-    sender: 'bot',
-    timestamp: formatTime(),
-    content: ''
-  };
-  scholarMessages.value.push(botMessage);
-  
-  try {
-    await chatAPI.sendMessage(
-      'academic',
-      text,
-      currentScholarConversationId.value,
-      (chunk) => {
-        const msg = scholarMessages.value.find(m => m.id === botMessageId);
-        if (msg) {
-          msg.content += chunk;
-        }
-      },
-      (error) => {
-        console.error('发送消息失败:', error);
-        const msg = scholarMessages.value.find(m => m.id === botMessageId);
-        if (msg) {
-          msg.content = '抱歉，发生了错误: ' + error.message;
-        }
-      },
-      () => {}
-    );
-  } catch (error) {
-    console.error('发送消息失败:', error);
-    const msg = scholarMessages.value.find(m => m.id === botMessageId);
     if (msg) {
       msg.content = '抱歉，发生了错误: ' + error.message;
     }
@@ -1033,12 +856,7 @@ const currentUser = computed(() => {
     let displayRole = '';
     let userId = '';
     
-    if (roleLower.includes('scholar') || roleLower.includes('visiting')) {
-      displayRole = 'Visiting Scholar';
-      department = userInfo.department || '访问学者';
-      avatar = 'Dr';
-      userId = userInfo.id || userInfo.username || 'Scholar';
-    } else if (roleLower.includes('student')) {
+    if (roleLower.includes('student')) {
       displayRole = '在校师生 (Student)';
       department = userInfo.department || '学生';
       avatar = name.substring(0, 2).toUpperCase();
@@ -1048,6 +866,11 @@ const currentUser = computed(() => {
       department = userInfo.department || '教师';
       avatar = name.substring(0, 2).toUpperCase();
       userId = userInfo.id || userInfo.username || 'Faculty';
+    } else if (roleLower.includes('admin')) {
+      displayRole = '管理员 (Admin)';
+      department = userInfo.department || '系统管理';
+      avatar = 'AD';
+      userId = userInfo.id || userInfo.username || 'Admin';
     } else {
       displayRole = role;
       department = userInfo.department || '';
@@ -1062,14 +885,8 @@ const currentUser = computed(() => {
       avatar: avatar,
       department: department
     };
-  } else {
-    // 默认值
-    if (currentMode.value === 'scholar') {
-      return { name: 'Prof. Zhang', id: 'SCH-2024', role: 'Visiting Scholar', avatar: 'Dr', department: '访问学者' };
-    } else {
-      return { name: '用户', id: 'User', role: '在校师生 (Student)', avatar: 'U', department: '学生' };
-    }
   }
+  return { name: '用户', id: 'User', role: '在校师生 (Student)', avatar: 'U', department: '学生' };
 });
 
 const studentWelcomeTitle = computed(() => {
@@ -1083,17 +900,15 @@ const userCardTitle = computed(() => {
   
   if (roleLower.includes('visitor') || roleLower.includes('guest')) {
     return 'Visitor Card';
-  } else if (roleLower.includes('scholar') || roleLower.includes('visiting')) {
-    return 'Scholar ID Card';
+  } else if (roleLower.includes('admin')) {
+    return 'Admin Card';
   } else if (roleLower.includes('teacher') || roleLower.includes('faculty')) {
     return 'Faculty ID Card';
   } else if (roleLower.includes('student')) {
     return 'Student ID Card';
   } else {
     // 默认根据模式判断
-    if (currentMode.value === 'scholar') {
-      return 'Scholar ID Card';
-    } else if (currentMode.value === 'student') {
+    if (currentMode.value === 'student') {
       return 'Student ID Card';
     } else {
       return 'Visitor Card';
@@ -1108,17 +923,15 @@ const userRoleEnglish = computed(() => {
   
   if (roleLower.includes('visitor') || roleLower.includes('guest')) {
     return 'Visitor';
-  } else if (roleLower.includes('scholar') || roleLower.includes('visiting')) {
-    return 'Visiting Scholar';
+  } else if (roleLower.includes('admin')) {
+    return 'Admin';
   } else if (roleLower.includes('teacher') || roleLower.includes('faculty')) {
     return 'Faculty';
   } else if (roleLower.includes('student')) {
     return 'Student';
   } else {
     // 默认根据模式判断
-    if (currentMode.value === 'scholar') {
-      return 'Visiting Scholar';
-    } else if (currentMode.value === 'student') {
+    if (currentMode.value === 'student') {
       return 'Student';
     } else {
       return 'Visitor';
@@ -1226,15 +1039,6 @@ const handleLogin = async () => {
       localStorage.removeItem('remembered_username');
     }
     
-    // 处理"记住密码"功能
-    if (rememberPassword.value) {
-      // 保存密码到localStorage（注意：实际应用中应该加密存储）
-      localStorage.setItem('remembered_password', loginForm.value.password);
-    } else {
-      // 清除保存的密码
-      localStorage.removeItem('remembered_password');
-    }
-    
     // 根据返回的角色决定模式
     const role = currentUserInfo.value.role || 'student';
     currentMode.value = getModeByRole(role);
@@ -1243,14 +1047,8 @@ const handleLogin = async () => {
     loggingIn.value = false;
     showLogin.value = false;
     
-    // 根据角色设置默认type
-    const available = getAvailableTypes(role);
-    currentType.value = available[0] || 'public';
-    
-    // 加载所有可用type的会话列表
-    for (const type of available) {
-      await loadTypeSessions(type);
-    }
+    currentType.value = 'auto';
+    await loadTypeSessions('auto');
     
     // 为当前type初始化会话
     if (typeSessions.value[currentType.value].conversations.length === 0) {
@@ -1277,13 +1075,13 @@ const handleGuestLogin = async () => {
     currentUserInfo.value = response.user_info || {};
     showLogin.value = false;
     currentMode.value = 'visitor';
-    currentType.value = 'public';
-    await loadTypeSessions('public');
-    if (typeSessions.value.public.conversations.length === 0) {
-      await handleTypeNewConversation('public');
+    currentType.value = 'auto';
+    await loadTypeSessions('auto');
+    if (typeSessions.value.auto.conversations.length === 0) {
+      await handleTypeNewConversation('auto');
     } else {
-      typeSessions.value.public.currentId = typeSessions.value.public.conversations[0].id;
-      await loadTypeHistory('public', typeSessions.value.public.conversations[0].id);
+      typeSessions.value.auto.currentId = typeSessions.value.auto.conversations[0].id;
+      await loadTypeHistory('auto', typeSessions.value.auto.conversations[0].id);
     }
   } catch (error) {
     console.error('访客登录失败:', error);
@@ -1300,11 +1098,13 @@ const handleLogout = async () => {
   
   // 重置所有状态
   showLogin.value = true;
+  showAdminPanel.value = false;
   currentMode.value = 'visitor';
-  currentType.value = 'public';
+  currentType.value = 'auto';
   
   // 清空所有type的会话数据
   typeSessions.value = {
+    auto: { conversations: [], currentId: '', messages: [] },
     public: { conversations: [], currentId: '', messages: [] },
     academic: { conversations: [], currentId: '', messages: [] },
     internal: { conversations: [], currentId: '', messages: [] },
@@ -1313,17 +1113,14 @@ const handleLogout = async () => {
   
   // 保留向后兼容（清空旧的独立状态）
   visitorConversations.value = [];
-  scholarConversations.value = [];
   studentConversations.value = [];
   deniedConversations.value = [];
   
   currentVisitorConversationId.value = '';
-  currentScholarConversationId.value = '';
   currentStudentConversationId.value = '';
   currentDeniedConversationId.value = '';
   
   visitorMessages.value = [];
-  scholarMessages.value = [];
   studentMessages.value = [];
   deniedMessages.value = [];
   
@@ -1331,9 +1128,9 @@ const handleLogout = async () => {
   loginError.value = '';
   currentUserInfo.value = null;
   
-  // 恢复"记住登录"和"记住密码"的内容
+  // 恢复记住的用户名，密码始终由用户重新输入
   const rememberedUsername = localStorage.getItem('remembered_username');
-  const rememberedPassword = localStorage.getItem('remembered_password');
+  localStorage.removeItem('remembered_password');
   
   if (rememberedUsername) {
     loginForm.value.email = rememberedUsername;
@@ -1343,13 +1140,7 @@ const handleLogout = async () => {
     rememberLogin.value = false;
   }
   
-  if (rememberedPassword) {
-    loginForm.value.password = rememberedPassword;
-    rememberPassword.value = true;
-  } else {
-    loginForm.value.password = '';
-    rememberPassword.value = false;
-  }
+  loginForm.value.password = '';
 };
 
 // 检查是否已登录
@@ -1361,12 +1152,7 @@ onMounted(async () => {
     rememberLogin.value = true;
   }
   
-  // 恢复"记住密码"的密码
-  const rememberedPassword = localStorage.getItem('remembered_password');
-  if (rememberedPassword) {
-    loginForm.value.password = rememberedPassword;
-    rememberPassword.value = true;
-  }
+  localStorage.removeItem('remembered_password');
   
   if (isAuthenticated()) {
     const userInfo = getUserInfo();
@@ -1378,14 +1164,8 @@ onMounted(async () => {
       currentMode.value = getModeByRole(role);
       showLogin.value = false;
       
-      // 根据角色设置默认type
-      const available = getAvailableTypes(role);
-      currentType.value = available[0] || 'public';
-      
-      // 加载所有可用type的会话列表
-      for (const type of available) {
-        await loadTypeSessions(type);
-      }
+      currentType.value = 'auto';
+      await loadTypeSessions('auto');
       
       // 为当前type初始化会话
       if (typeSessions.value[currentType.value].conversations.length > 0) {
@@ -1395,6 +1175,8 @@ onMounted(async () => {
           currentType.value,
           typeSessions.value[currentType.value].conversations[0].id
         );
+      } else {
+        await handleTypeNewConversation(currentType.value);
       }
     } else {
       showLogin.value = true;
@@ -1404,15 +1186,21 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div v-if="showLogin" class="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-blue-900 flex items-center justify-center px-4 py-10">
+  <div v-if="showLogin" class="min-h-screen bg-[radial-gradient(circle_at_15%_20%,_#164e63_0,_#172033_38%,_#0f172a_100%)] flex items-center justify-center px-4 py-10 relative overflow-hidden">
+    <div class="absolute -top-32 -right-24 w-96 h-96 rounded-full bg-emerald-400/10 blur-3xl"></div>
+    <div class="absolute -bottom-40 -left-24 w-[30rem] h-[30rem] rounded-full bg-cyan-400/10 blur-3xl"></div>
     <div class="max-w-5xl w-full grid md:grid-cols-2 gap-8 items-center">
       <div class="text-white space-y-6">
         <div class="flex items-center gap-3 text-2xl font-bold">
-          <div class="w-10 h-10 rounded bg-blue-600 flex items-center justify-center shadow-lg">S</div>
-          SynapseQ
+          <div class="w-11 h-11 rounded-2xl bg-gradient-to-br from-cyan-300 to-emerald-300 text-slate-950 flex items-center justify-center shadow-xl shadow-cyan-950/30">S</div>
+          <div>
+            <div>SynapseQ</div>
+            <div class="text-[10px] font-normal tracking-[0.25em] text-cyan-100/70">同济校园智能问答</div>
+          </div>
         </div>
         <div>
-          <div class="text-3xl md:text-4xl font-bold leading-tight">统一身份登录</div>
+          <div class="text-4xl md:text-5xl font-semibold leading-tight tracking-tight">让校园信息更近一步</div>
+          <p class="mt-4 text-slate-300 max-w-lg leading-7">系统会按登录身份自动检索公开资料、校内信息与个人档案，无需手动选择模块。</p>
         </div>
         <div class="flex flex-wrap gap-3 text-xs text-slate-200">
           <span class="px-3 py-1 rounded-full bg-white/10 border border-white/10 flex items-center gap-1">
@@ -1425,7 +1213,7 @@ onMounted(async () => {
             <Sparkles class="w-4 h-4" /> 上下文智能理解
           </span>
         </div>
-        <div class="hidden md:block bg-white/5 border border-white/10 rounded-2xl p-4 shadow-xl">
+        <div class="hidden md:block bg-white/[0.06] border border-white/10 rounded-3xl p-5 shadow-2xl backdrop-blur">
           <div class="text-sm font-semibold flex items-center gap-2 text-white mb-2">
             <Database class="w-4 h-4" /> 预览已连接集合
           </div>
@@ -1455,7 +1243,7 @@ onMounted(async () => {
         </div>
       </div>
 
-      <div class="bg-white rounded-2xl shadow-2xl border border-slate-100/80 p-8 space-y-6">
+      <div class="bg-white/95 backdrop-blur rounded-3xl shadow-2xl border border-white/70 p-8 space-y-6 relative z-10">
           <div class="space-y-1">
           <div class="text-xl font-semibold text-slate-900">
             统一身份登录
@@ -1477,7 +1265,7 @@ onMounted(async () => {
                 v-model="loginForm.email"
                 type="text"
                 placeholder="请输入用户名"
-                class="w-full pl-9 pr-3 py-2.5 rounded-xl bg-slate-50 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-400 text-sm"
+                class="w-full pl-9 pr-3 py-2.5 rounded-xl bg-slate-50 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-cyan-200 focus:border-cyan-500 text-sm"
               />
             </div>
           </div>
@@ -1489,25 +1277,17 @@ onMounted(async () => {
                 v-model="loginForm.password"
                 type="password"
                 placeholder="••••••••"
-                class="w-full pl-9 pr-3 py-2.5 rounded-xl bg-slate-50 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-400 text-sm"
+                class="w-full pl-9 pr-3 py-2.5 rounded-xl bg-slate-50 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-cyan-200 focus:border-cyan-500 text-sm"
               />
             </div>
-            <div class="flex items-center justify-end gap-4 text-xs text-slate-500 mt-2">
+            <div class="flex items-center justify-end text-xs text-slate-500 mt-2">
               <label class="inline-flex items-center gap-2 cursor-pointer">
                 <input 
                   type="checkbox" 
                   v-model="rememberLogin"
-                  class="rounded border-slate-300 text-blue-600 focus:ring-blue-200" 
+                  class="rounded border-slate-300 text-cyan-700 focus:ring-cyan-200"
                 />
-                记住登录
-              </label>
-              <label class="inline-flex items-center gap-2 cursor-pointer">
-                <input 
-                  type="checkbox" 
-                  v-model="rememberPassword"
-                  class="rounded border-slate-300 text-blue-600 focus:ring-blue-200" 
-                />
-                记住密码
+                记住用户名
               </label>
             </div>
           </div>
@@ -1515,7 +1295,7 @@ onMounted(async () => {
 
         <div class="space-y-3">
           <button
-            class="w-full py-2.5 rounded-xl bg-blue-600 text-white font-semibold shadow-lg hover:bg-blue-700 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+            class="w-full py-2.5 rounded-xl bg-cyan-700 text-white font-semibold shadow-lg shadow-cyan-900/20 hover:bg-cyan-800 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
             :disabled="loggingIn || !loginForm.email || !loginForm.password"
             @click="handleLogin"
           >
@@ -1535,28 +1315,12 @@ onMounted(async () => {
         </div>
 
         <div class="text-[11px] text-slate-400 leading-relaxed">
-          登录即同意 <a class="text-blue-600 hover:underline" href="#">用户协议</a> 与 <a class="text-blue-600 hover:underline" href="#">隐私政策</a>。
+          登录即同意 <a class="text-cyan-700 hover:underline" href="#">用户协议</a> 与 <a class="text-cyan-700 hover:underline" href="#">隐私政策</a>。
         </div>
       </div>
     </div>
   </div>
   <div v-else class="h-screen flex flex-col bg-white">
-    <!-- Type切换器 -->
-    <div class="border-b bg-white px-4 py-2 flex items-center gap-2 overflow-x-auto">
-      <div class="text-xs font-semibold text-gray-500 mr-2 flex-shrink-0">模块:</div>
-      <div class="flex gap-2">
-        <button
-          v-for="type in availableTypes"
-          :key="type"
-          @click="handleTypeChange(type)"
-          :class="getTypeButtonClass(type)"
-        >
-          <component :is="typeConfig[type].icon" size="16" />
-          <span>{{ typeConfig[type].label }}</span>
-        </button>
-      </div>
-    </div>
-    
     <div class="flex-1 overflow-hidden relative">
       <div class="w-full h-full bg-white overflow-hidden">
         <!-- 统一的Type管理界面 -->
@@ -1611,6 +1375,15 @@ onMounted(async () => {
               </div>
             </div>
 
+            <div class="mt-4" v-if="isAdminUser">
+              <button
+                @click="showAdminPanel = true"
+                class="w-full p-3 bg-cyan-700 text-white rounded-lg text-sm font-semibold cursor-pointer transition-colors flex items-center justify-center gap-2 hover:bg-cyan-800 shadow-sm"
+              >
+                管理后台
+              </button>
+            </div>
+
             <div class="mt-4" v-if="getUserCommonServices().length > 0">
               <h4 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
                 <FileText v-if="currentMode === 'student'" size="14" />
@@ -1638,7 +1411,7 @@ onMounted(async () => {
                 <button
                   v-for="q in getPopularQuestions('public')"
                   :key="q"
-                  @click="handleTypeSend('public', q)"
+                  @click="handleTypeSend('auto', q)"
                   class="w-full p-3 bg-white border border-gray-100 rounded-lg text-xs text-gray-600 hover:border-green-200 hover:text-green-700 cursor-pointer transition-colors flex items-center justify-between group text-left"
                 >
                   <span>{{ q }}</span>
@@ -1648,6 +1421,11 @@ onMounted(async () => {
             </div>
           </template>
         </SynapseQShell>
+
+        <AdminPanel
+          v-if="showAdminPanel && isAdminUser"
+          @close="showAdminPanel = false"
+        />
         
         <!-- 保留向后兼容的旧模式组件 -->
         <!-- Visitor -->
@@ -1713,88 +1491,6 @@ onMounted(async () => {
                   <span>{{ q }}</span>
                   <ChevronRight size="12" class="opacity-0 group-hover:opacity-100 transition-opacity" />
                 </button>
-              </div>
-            </div>
-          </template>
-        </SynapseQShell>
-
-        <!-- Scholar -->
-        <SynapseQShell
-          v-if="false && currentMode === 'scholar'"
-          themeColor="purple"
-          headerTitle="学术科研模式 (Academic Mode)"
-          headerBadge="Knowledge 库已连接"
-          :currentUser="currentUser"
-          :conversationHistory="scholarConversations"
-          :currentConversationId="currentScholarConversationId"
-          :messages="scholarMessages"
-          :exampleQuestions="scholarExampleQuestions"
-          welcomeTitle="欢迎使用 SynapseQ 学术模式"
-          @send-message="handleScholarSend"
-          @new-conversation="handleScholarNewConversation"
-          @switch-conversation="handleScholarSwitchConversation"
-          @delete-conversation="handleScholarDeleteConversation"
-          @logout="handleLogout"
-        >
-          <template #right-panel>
-            <div class="bg-gradient-to-br from-purple-500 to-pink-600 rounded-xl p-4 text-white shadow-lg relative overflow-hidden">
-              <div class="absolute top-0 right-0 p-3 opacity-20">
-                <Shield size="64" />
-              </div>
-              <div class="relative z-10">
-                <div class="text-xs opacity-80 uppercase tracking-widest mb-1">{{ userCardTitle }}</div>
-                <div class="text-2xl font-bold tracking-tight mb-4">{{ currentUser.id }}</div>
-                <div class="flex items-end justify-between">
-                  <div>
-                    <div class="text-sm font-medium">{{ currentUser.name }}</div>
-                    <div class="text-xs opacity-80">{{ currentUser.department }}</div>
-                  </div>
-                  <div class="w-10 h-10 rounded bg-white/20 backdrop-blur-sm flex items-center justify-center font-bold text-lg">
-                    {{ currentUser.avatar }}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div class="mt-4">
-              <h4 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">已连接的向量集合</h4>
-              <div class="space-y-2">
-                <div class="flex items-center justify-between p-3 bg-green-50 rounded-lg border border-green-100">
-                  <div class="flex items-center gap-2">
-                    <div class="w-2 h-2 rounded-full bg-green-500"></div>
-                    <span class="text-sm font-medium text-gray-700">Standard (公开)</span>
-                  </div>
-                  <span class="text-xs bg-white px-2 py-0.5 rounded text-gray-500 border border-gray-100">Read</span>
-                </div>
-                <div class="flex items-center justify-between p-3 bg-purple-50 rounded-lg border border-purple-100">
-                  <div class="flex items-center gap-2">
-                    <div class="w-2 h-2 rounded-full bg-purple-500"></div>
-                    <span class="text-sm font-medium text-gray-700">Knowledge (学术)</span>
-                  </div>
-                  <span class="text-xs bg-white px-2 py-0.5 rounded text-gray-500 border border-gray-100">Read</span>
-                </div>
-              </div>
-            </div>
-
-            <div class="mt-4">
-              <h4 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                <Search size="14" /> 快速访问
-              </h4>
-              <div class="space-y-2">
-                <a
-                  v-for="service in [
-                    { name: '学术知识库', url: 'https://ir.tongji.edu.cn/tongji/' },
-                    { name: '同济大学图书馆', url: 'https://www.lib.tongji.edu.cn/' }
-                  ]"
-                  :key="service.name"
-                  :href="service.url"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  class="w-full p-3 bg-white border border-purple-200 text-purple-700 rounded-lg text-xs cursor-pointer transition-colors flex items-center justify-between group text-left hover:bg-purple-50 hover:border-purple-300"
-                >
-                  <span>{{ service.name }}</span>
-                  <ChevronRight size="12" class="opacity-100 transition-opacity" />
-                </a>
               </div>
             </div>
           </template>

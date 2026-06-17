@@ -1122,7 +1122,10 @@ def crawl_standard_info(urls: List[str], max_pages: int = 50, use_semantic_block
                                 url=block["url"],
                                 title=block["title"],
                                 section=block["section"],
-                                text_preview=text_preview
+                                collection_name=settings.COLLECTION_STANDARD,
+                                access_scope="public",
+                                text_preview=text_preview,
+                                text_content=chunk,
                             )
                             crawl_blocks.append(crawl_block)
                             db_session.add(crawl_block)
@@ -1135,7 +1138,10 @@ def crawl_standard_info(urls: List[str], max_pages: int = 50, use_semantic_block
                             url=block["url"],
                             title=block["title"],
                             section=block["section"],
-                            text_preview=text_preview
+                            collection_name=settings.COLLECTION_STANDARD,
+                            access_scope="public",
+                            text_preview=text_preview,
+                            text_content=block["text"],
                         )
                         crawl_blocks.append(crawl_block)
                         db_session.add(crawl_block)
@@ -1156,7 +1162,10 @@ def crawl_standard_info(urls: List[str], max_pages: int = 50, use_semantic_block
                             url=url,
                             title="页面内容",
                             section="其他",
-                            text_preview=text_preview
+                            collection_name=settings.COLLECTION_STANDARD,
+                            access_scope="public",
+                            text_preview=text_preview,
+                            text_content=chunk,
                         )
                         crawl_blocks.append(crawl_block)
                         db_session.add(crawl_block)
@@ -1290,7 +1299,10 @@ def crawl_academic_info(urls: List[str], max_pages: int = 30):
                         url=url,
                         title="学术内容",
                         section="学术信息",
-                        text_preview=text_preview
+                        collection_name=settings.COLLECTION_KNOWLEDGE,
+                        access_scope="campus",
+                        text_preview=text_preview,
+                        text_content=chunk,
                     )
                     crawl_blocks.append(crawl_block)
                     db_session.add(crawl_block)

@@ -14,7 +14,7 @@ import sys
 import argparse
 from pathlib import Path
 
-from pymilvus import MilvusClient, connections, Collection
+from pymilvus import MilvusClient
 
 # 保证能找到 app 模块（与 crawler.py、import_csv_to_milvus.py 保持一致）
 project_root = Path(__file__).parent.parent
@@ -50,9 +50,12 @@ def show_counts(client: MilvusClient) -> None:
     total = 0
     for name in collections:
         try:
-            # 使用 ORM 接口获取集合实体数量，兼容当前 pymilvus 版本
-            col = Collection(name)
-            row_count = int(col.num_entities)
+            result = client.query(
+                collection_name=name,
+                filter="",
+                output_fields=["count(*)"],
+            )
+            row_count = int(result[0]["count(*)"])
         except Exception as e:  # noqa: BLE001
             print(f"{name:40} | 读取失败: {e}")
             continue
@@ -86,8 +89,6 @@ def main() -> None:
     args = parser.parse_args()
 
     client = connect_milvus(args.host, args.port)
-    # 初始化 ORM 连接，以便 Collection() 能正常工作
-    connections.connect(alias="default", uri=f"http://{args.host}:{args.port}")
     show_counts(client)
 
 

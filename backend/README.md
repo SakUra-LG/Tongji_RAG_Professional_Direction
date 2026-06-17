@@ -6,7 +6,7 @@
 
 本项目采用现代化的 Python 异步技术栈构建，核心功能包括：
 
-- **多模态检索管道**：针对不同用户角色和场景定制的检索策略（Public, Scholar, Internal, Personal）。
+- **多场景检索管道**：针对不同用户角色和场景定制的检索策略（Public, Academic, Internal, Personal）。
 - **智能查询优化**：基于 LLM 的查询重写和关键词重排序（Rerank）。
 - **会话管理**：基于 Redis 的分布式会话存储，支持上下文记忆。
 - **混合检索**：结合向量检索（Milvus）与关键词匹配，支持元数据过滤。
@@ -41,16 +41,17 @@ app/
 系统根据 API 请求的类型 (`type`) 路由到不同的处理管道：
 
 - **PublicPipeline (公共场景)**
-  - 优先检索官方 FAQ 库，命中阈值以上直接返回预设答案。
+  - 优先匹配 `app/manual_faqs.py` 中的本地 FAQ，命中后不调用外部模型。
+  - 本地未命中时继续检索 Milvus FAQ 库，命中阈值以上直接返回预设答案。
   - 未命中 FAQ 时，进行标准向量检索，使用关键词重排序优化 Top-K 结果。
-- **ScholarPipeline (学术场景)**
+- **AcademicPipeline (学术场景)**
   - 混合检索标准库与知识库。
   - 使用学术风格的 Prompt 模板，强调引用来源和综述性回答。
 - **InternalPipeline (内部场景)**
-  - 结合用户部门 ID (`dept_id`) 进行元数据过滤。
-  - 检索内部文档库与公共库，确保信息安全与相关性。
+  - 从 MySQL 通知表按部门 ID (`dept_id`) 和受众 (`audience`) 双重过滤。
+  - 结合公共/学术资料，避免学生读取面向教师的院系通知。
 - **PersonalPipeline (个人场景)**
-  - 严格根据 User ID 过滤个人数据集合。
+  - 严格根据 User ID 读取结构化个人档案，并过滤个人向量集合。
   - 提供精确的数据陈述，不进行过度推断。
 
 ### 2. 核心组件
@@ -102,4 +103,3 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000 --reload
 
 - **Guest**: 仅可访问 Public 模块，有速率限制。
 - **Student/Teacher**: 可访问 Public, Academic, Internal (视部门而定), Personal 模块。
-- **Scholar**: 可访问 Public, Academic 模块。

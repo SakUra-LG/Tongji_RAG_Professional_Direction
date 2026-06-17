@@ -4,34 +4,61 @@ import redis
 import jwt
 import datetime
 import uuid
+import hashlib
+import logging
 from jwt.exceptions import PyJWTError, ExpiredSignatureError
 from fastapi import FastAPI, Header, HTTPException, Depends, status, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from passlib.context import CryptContext
 from typing import Set
 
 from app.config import settings
 from app.dto import (
     RequestPayload, UserContext, LoginRequest, LoginResponse, RefreshRequest,
-    SessionSchema, SessionListResponse, SessionHistoryResponse, CreateSessionRequest
+    SessionSchema, SessionListResponse, SessionHistoryResponse, CreateSessionRequest,
+    CourseScheduleSchema, MyProfileResponse, NoticeSchema, StudentGradeSchema,
+    StudentProfileSchema, TeacherProfileSchema,
+    AdminCrawlPreviewRequest, AdminCrawlPreviewResponse, AdminCrawlSaveRequest,
+    AdminFAQSchema, AdminFAQUpsertRequest, AdminKnowledgeBlockSchema,
 )
 from app.database import get_db
-from app.models_db import User 
-from app.pipelines import PublicPipeline, ScholarPipeline, InternalPipeline, PersonalPipeline
+from app.models_db import (
+    CampusNotice,
+    CourseSchedule,
+    CrawlBlock,
+    CrawlTask,
+    ManagedFAQ,
+    StudentGrade,
+    StudentProfile,
+    TeacherProfile,
+    User,
+)
+from app.admin_tools import crawl_preview, save_blocks_to_knowledge_base
+from app.pipelines import (
+    AcademicPipeline,
+    AutoPipeline,
+    InternalPipeline,
+    PersonalPipeline,
+    PublicPipeline,
+)
 from app.components import HistoryManager
+from pymilvus import MilvusClient
+from scripts.sync_manual_faqs import sync_manual_faqs
 
-VALID_SESSION_TYPES = {"public", "academic", "internal", "personal"}
+logger = logging.getLogger(__name__)
+
+VALID_SESSION_TYPES = {"auto", "public", "academic", "internal", "personal"}
 
 app = FastAPI(title="Tongji RAG System")
 
 # CORS 中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -52,20 +79,22 @@ history_manager = HistoryManager()
 ROLE_GUEST = "guest"
 ROLE_STUDENT = "student"
 ROLE_TEACHER = "teacher"
-ROLE_SCHOLAR = "scholar"
+ROLE_ADMIN = "admin"
 
 # 路由权限表
 ROUTE_PERMISSIONS = {
-    "public": {ROLE_GUEST, ROLE_STUDENT, ROLE_TEACHER, ROLE_SCHOLAR},
-    "academic": {ROLE_STUDENT, ROLE_TEACHER, ROLE_SCHOLAR},
+    "auto": {ROLE_GUEST, ROLE_STUDENT, ROLE_TEACHER, ROLE_ADMIN},
+    "public": {ROLE_GUEST, ROLE_STUDENT, ROLE_TEACHER, ROLE_ADMIN},
+    "academic": {ROLE_STUDENT, ROLE_TEACHER},
     "internal": {ROLE_STUDENT, ROLE_TEACHER},
     "personal": {ROLE_STUDENT, ROLE_TEACHER}
 }
 
 # Pipeline 工厂
 pipelines = {
+    "auto": AutoPipeline(),
     "public": PublicPipeline(),
-    "academic": ScholarPipeline(),
+    "academic": AcademicPipeline(),
     "internal": InternalPipeline(),
     "personal": PersonalPipeline()
 }
@@ -75,6 +104,10 @@ security = HTTPBearer(auto_error=False)
 # --- 辅助函数 ---
 def verify_password(plain, hashed):
     return pwd_context.verify(plain, hashed)
+
+def refresh_token_key(token: str) -> str:
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return f"{settings.REDIS_REFRESH_PREFIX}{digest}"
 
 def create_tokens(user_id: str, role: str, dept: str = None):
     access_expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -99,7 +132,10 @@ def create_tokens(user_id: str, role: str, dept: str = None):
     return access_token, refresh_token, settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
 
 # --- 鉴权依赖 ---
-async def get_current_user(auth: HTTPAuthorizationCredentials = Depends(security)) -> UserContext:
+async def get_current_user(
+    auth: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db),
+) -> UserContext:
     # 1. 如果没有携带 Authorization 头，auth 会是 None -> 降级为游客
     if not auth:
         return UserContext(user_id="guest", user_role=ROLE_GUEST)
@@ -112,10 +148,32 @@ async def get_current_user(auth: HTTPAuthorizationCredentials = Depends(security
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Invalid token type")
 
+        user_id = str(payload.get("sub"))
+        token_role = payload.get("role", ROLE_GUEST)
+        if token_role == ROLE_GUEST:
+            if not user_id.startswith("guest_"):
+                raise HTTPException(status_code=401, detail="Invalid guest token")
+            return UserContext(user_id=user_id, user_role=ROLE_GUEST)
+
+        if not user_id.isdigit():
+            raise HTTPException(status_code=401, detail="Invalid user identity")
+
+        result = await db.execute(select(User).where(User.id == int(user_id)))
+        db_user = result.scalars().first()
+        if (
+            db_user is None
+            or not db_user.is_active
+            or db_user.role not in {ROLE_STUDENT, ROLE_TEACHER, ROLE_ADMIN}
+        ):
+            raise HTTPException(status_code=401, detail="User is unavailable")
+
+        # Role and department are always read from MySQL. Token claims are
+        # only a signed identity hint and may be stale after account changes.
         return UserContext(
-            user_id=str(payload.get("sub")),
-            user_role=payload.get("role", ROLE_GUEST),
-            dept_id=payload.get("dept")
+            user_id=str(db_user.id),
+            user_name=db_user.full_name or db_user.username,
+            user_role=db_user.role,
+            dept_id=db_user.dept_id,
         )
     except ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired")
@@ -135,17 +193,24 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
     
     if not user.is_active:
         raise HTTPException(status_code=403, detail="User is inactive")
+    if user.role not in {ROLE_STUDENT, ROLE_TEACHER, ROLE_ADMIN}:
+        raise HTTPException(status_code=403, detail="Unsupported user role")
 
     at, rt, expires_in = create_tokens(str(user.id), user.role, user.dept_id)
     
-    redis_key = f"{settings.REDIS_REFRESH_PREFIX}{rt}"
+    redis_key = refresh_token_key(rt)
     redis_client.set(redis_key, str(user.id), ex=settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 3600)
     
     return LoginResponse(
         access_token=at, 
         refresh_token=rt, 
         expires_in=expires_in,
-        user_info={"name": user.full_name, "role": user.role}
+        user_info={
+            "id": str(user.id),
+            "name": user.full_name,
+            "role": user.role,
+            "department": user.dept_id,
+        }
     )
 
 # 游客登录接口
@@ -154,7 +219,7 @@ async def guest_login():
     guest_id = f"guest_{uuid.uuid4()}"
     at, rt, expires_in = create_tokens(user_id=guest_id, role=ROLE_GUEST, dept=None)
     
-    redis_key = f"{settings.REDIS_REFRESH_PREFIX}{rt}"
+    redis_key = refresh_token_key(rt)
     redis_client.set(redis_key, guest_id, ex=86400)
     
     return LoginResponse(
@@ -171,7 +236,7 @@ async def guest_login():
 @app.post("/api/v1/refresh")
 async def refresh_token(request: RefreshRequest, db: AsyncSession = Depends(get_db)):
     old_rt = request.refresh_token
-    redis_key_old = f"{settings.REDIS_REFRESH_PREFIX}{old_rt}"
+    redis_key_old = refresh_token_key(old_rt)
     
     user_id = redis_client.get(redis_key_old)
     if not user_id:
@@ -197,7 +262,7 @@ async def refresh_token(request: RefreshRequest, db: AsyncSession = Depends(get_
     pipe = redis_client.pipeline()
     try:
         pipe.delete(redis_key_old)
-        redis_key_new = f"{settings.REDIS_REFRESH_PREFIX}{new_rt}"
+        redis_key_new = refresh_token_key(new_rt)
         ttl = 86400 if user_role == ROLE_GUEST else settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 3600
         pipe.set(redis_key_new, str(user_id), ex=ttl)
         pipe.execute()
@@ -208,16 +273,381 @@ async def refresh_token(request: RefreshRequest, db: AsyncSession = Depends(get_
         "access_token": new_at, 
         "refresh_token": new_rt, 
         "expires_in": expires_in, 
-        "user_info": {"name": user_name}
+        "user_info": {
+            "id": str(user_id),
+            "name": user_name,
+            "role": user_role,
+            "department": user_dept,
+        }
     }
 
 @app.post("/api/v1/logout")
 async def logout(request: RefreshRequest):
-    redis_key = f"{settings.REDIS_REFRESH_PREFIX}{request.refresh_token}"
+    redis_key = refresh_token_key(request.refresh_token)
     redis_client.delete(redis_key)
     return {"message": "Logged out successfully"}
 
+@app.get("/health")
+async def health():
+    redis_client.ping()
+    return {"status": "ok"}
+
+
+async def require_admin(user: UserContext = Depends(get_current_user)) -> UserContext:
+    if user.user_role != ROLE_ADMIN:
+        raise HTTPException(status_code=403, detail="Admin account required")
+    return user
+
+
+def faq_to_schema(faq: ManagedFAQ) -> AdminFAQSchema:
+    return AdminFAQSchema(
+        id=faq.id,
+        question=faq.question,
+        answer=faq.answer,
+        source=faq.source,
+        aliases=[item.strip() for item in (faq.aliases or "").splitlines() if item.strip()],
+        is_active=faq.is_active,
+    )
+
+
+def sync_faq_collection() -> None:
+    client = MilvusClient(uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}")
+    sync_manual_faqs(client)
+
+
+def infer_block_collection(block: CrawlBlock, task: CrawlTask | None) -> str:
+    if block.collection_name:
+        return block.collection_name
+    if task and task.collection_name:
+        return task.collection_name
+    url = block.url or ""
+    for collection_name in (
+        settings.COLLECTION_STANDARD,
+        settings.COLLECTION_KNOWLEDGE,
+        settings.COLLECTION_FAQ,
+        settings.COLLECTION_INTERNAL,
+        settings.COLLECTION_PERSONAL,
+    ):
+        if collection_name in url:
+            return collection_name
+    return ""
+
+
+def infer_access_scope(collection_name: str, block: CrawlBlock) -> str:
+    if block.access_scope:
+        return block.access_scope
+    if collection_name in {settings.COLLECTION_STANDARD, settings.COLLECTION_FAQ}:
+        return "public"
+    if collection_name in {settings.COLLECTION_KNOWLEDGE, settings.COLLECTION_INTERNAL}:
+        return "campus"
+    return ""
+
+
+@app.get("/api/v1/admin/faqs", response_model=list[AdminFAQSchema])
+async def admin_list_faqs(
+    _: UserContext = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(ManagedFAQ).order_by(ManagedFAQ.id.asc()))
+    return [faq_to_schema(item) for item in result.scalars().all()]
+
+
+@app.post("/api/v1/admin/faqs", response_model=AdminFAQSchema)
+async def admin_create_faq(
+    request: AdminFAQUpsertRequest,
+    _: UserContext = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    faq = ManagedFAQ(
+        question=request.question.strip(),
+        answer=request.answer.strip(),
+        source=(request.source or "后台FAQ").strip(),
+        aliases="\n".join(request.aliases),
+        is_active=request.is_active,
+    )
+    db.add(faq)
+    await db.commit()
+    await db.refresh(faq)
+    sync_faq_collection()
+    return faq_to_schema(faq)
+
+
+@app.put("/api/v1/admin/faqs/{faq_id}", response_model=AdminFAQSchema)
+async def admin_update_faq(
+    faq_id: int,
+    request: AdminFAQUpsertRequest,
+    _: UserContext = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(ManagedFAQ).where(ManagedFAQ.id == faq_id))
+    faq = result.scalars().first()
+    if faq is None:
+        raise HTTPException(status_code=404, detail="FAQ not found")
+    faq.question = request.question.strip()
+    faq.answer = request.answer.strip()
+    faq.source = (request.source or "后台FAQ").strip()
+    faq.aliases = "\n".join(request.aliases)
+    faq.is_active = request.is_active
+    await db.commit()
+    await db.refresh(faq)
+    sync_faq_collection()
+    return faq_to_schema(faq)
+
+
+@app.get("/api/v1/admin/knowledge", response_model=list[AdminKnowledgeBlockSchema])
+async def admin_list_knowledge(
+    collection: str | None = None,
+    _: UserContext = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(CrawlBlock)
+        .order_by(CrawlBlock.created_at.desc(), CrawlBlock.id.desc())
+        .limit(1000)
+    )
+    raw_blocks = list(result.scalars().all())
+    task_ids = sorted({item.task_id for item in raw_blocks if item.task_id})
+    task_by_id = {}
+    if task_ids:
+        task_result = await db.execute(select(CrawlTask).where(CrawlTask.id.in_(task_ids)))
+        task_by_id = {item.id: item for item in task_result.scalars().all()}
+
+    blocks = []
+    for item in raw_blocks:
+        task = task_by_id.get(item.task_id)
+        inferred_collection = infer_block_collection(item, task)
+        if collection and inferred_collection != collection:
+            continue
+        inferred_scope = infer_access_scope(inferred_collection, item)
+        blocks.append(
+            AdminKnowledgeBlockSchema(
+                id=item.id,
+                task_id=item.task_id,
+                title=item.title,
+                section=item.section,
+                url=item.url,
+                collection_name=inferred_collection,
+                access_scope=inferred_scope,
+                text_preview=item.text_preview,
+                text_content=item.text_content or item.text_preview,
+                milvus_id=item.milvus_id,
+                created_at=item.created_at.isoformat() if item.created_at else "",
+            )
+        )
+        if len(blocks) >= 200:
+            break
+
+    if collection in {None, "", settings.COLLECTION_FAQ}:
+        faq_result = await db.execute(
+            select(ManagedFAQ).order_by(ManagedFAQ.updated_at.desc(), ManagedFAQ.id.desc())
+        )
+        for faq in faq_result.scalars().all():
+            blocks.append(
+                AdminKnowledgeBlockSchema(
+                    id=-faq.id,
+                    task_id=0,
+                    title=faq.question,
+                    section="FAQ",
+                    url=f"faq://managed/{faq.id}",
+                    collection_name=settings.COLLECTION_FAQ,
+                    access_scope="public",
+                    text_preview=faq.answer[:500],
+                    text_content=faq.answer,
+                    milvus_id=None,
+                    created_at=faq.updated_at.isoformat() if faq.updated_at else "",
+                )
+            )
+            if len(blocks) >= 200:
+                break
+    return blocks
+
+
+@app.post("/api/v1/admin/crawl/preview", response_model=AdminCrawlPreviewResponse)
+async def admin_crawl_preview(
+    request: AdminCrawlPreviewRequest,
+    _: UserContext = Depends(require_admin),
+):
+    blocks = crawl_preview(request.url, request.max_pages)
+    return AdminCrawlPreviewResponse(source_url=request.url, blocks=blocks)
+
+
+@app.post("/api/v1/admin/crawl/save")
+async def admin_crawl_save(
+    request: AdminCrawlSaveRequest,
+    _: UserContext = Depends(require_admin),
+):
+    result = save_blocks_to_knowledge_base(
+        start_url=request.source_url,
+        access_scope=request.access_scope,
+        blocks=[block.model_dump() for block in request.blocks],
+    )
+    return result
+
 # 会话管理
+@app.get("/api/v1/me/profile", response_model=MyProfileResponse)
+async def get_my_profile(
+    user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if user.user_role not in {ROLE_STUDENT, ROLE_TEACHER} or not user.user_id.isdigit():
+        raise HTTPException(status_code=403, detail="Student or teacher login required")
+
+    result = await db.execute(select(User).where(User.id == int(user.user_id)))
+    db_user = result.scalars().first()
+    if db_user is None or db_user.role != user.user_role:
+        raise HTTPException(status_code=404, detail="User profile not found")
+
+    student_profile = None
+    teacher_profile = None
+    grades = []
+
+    if db_user.role == ROLE_STUDENT:
+        result = await db.execute(
+            select(StudentProfile).where(StudentProfile.user_id == db_user.id)
+        )
+        profile = result.scalars().first()
+        if profile:
+            student_profile = StudentProfileSchema(
+                student_no=profile.student_no,
+                college_name=profile.college_name,
+                major=profile.major,
+                grade_year=profile.grade_year,
+                class_name=profile.class_name,
+                gpa=float(profile.gpa) if profile.gpa is not None else None,
+                major_rank=profile.major_rank,
+                earned_credits=(
+                    float(profile.earned_credits)
+                    if profile.earned_credits is not None
+                    else None
+                ),
+                campus=profile.campus,
+            )
+
+        result = await db.execute(
+            select(StudentGrade)
+            .where(StudentGrade.user_id == db_user.id)
+            .order_by(StudentGrade.semester.desc())
+        )
+        grades = [
+            StudentGradeSchema(
+                id=item.id,
+                semester=item.semester,
+                course_code=item.course_code,
+                course_name=item.course_name,
+                score=float(item.score) if item.score is not None else None,
+                grade_point=(
+                    float(item.grade_point) if item.grade_point is not None else None
+                ),
+                credits=float(item.credits) if item.credits is not None else None,
+            )
+            for item in result.scalars().all()
+        ]
+    else:
+        result = await db.execute(
+            select(TeacherProfile).where(TeacherProfile.user_id == db_user.id)
+        )
+        profile = result.scalars().first()
+        if profile:
+            teacher_profile = TeacherProfileSchema(
+                employee_no=profile.employee_no,
+                college_name=profile.college_name,
+                title=profile.title,
+                office=profile.office,
+                research_direction=profile.research_direction,
+                campus=profile.campus,
+            )
+
+    result = await db.execute(
+        select(CourseSchedule)
+        .where(CourseSchedule.user_id == db_user.id)
+        .order_by(
+            CourseSchedule.semester.desc(),
+            CourseSchedule.weekday.asc(),
+            CourseSchedule.start_time.asc(),
+            CourseSchedule.start_section.asc(),
+        )
+    )
+    schedules = [
+        CourseScheduleSchema(
+            id=item.id,
+            semester=item.semester,
+            course_code=item.course_code,
+            course_name=item.course_name,
+            instructor=item.instructor,
+            weekday=item.weekday,
+            start_section=item.start_section,
+            end_section=item.end_section,
+            start_time=(
+                item.start_time.isoformat(timespec="minutes")
+                if item.start_time
+                else None
+            ),
+            end_time=(
+                item.end_time.isoformat(timespec="minutes")
+                if item.end_time
+                else None
+            ),
+            location=item.location,
+            week_range=item.week_range,
+            status=item.status,
+        )
+        for item in result.scalars().all()
+    ]
+
+    return MyProfileResponse(
+        user_id=str(db_user.id),
+        username=db_user.username,
+        full_name=db_user.full_name,
+        role=db_user.role,
+        dept_id=db_user.dept_id,
+        student_profile=student_profile,
+        teacher_profile=teacher_profile,
+        course_schedules=schedules,
+        grades=grades,
+    )
+
+
+@app.get("/api/v1/notices", response_model=list[NoticeSchema])
+async def get_notices(
+    user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if user.user_role not in {ROLE_STUDENT, ROLE_TEACHER}:
+        raise HTTPException(status_code=403, detail="Student or teacher login required")
+
+    now = datetime.datetime.now()
+    result = await db.execute(
+        select(CampusNotice)
+        .where(
+            CampusNotice.is_active.is_(True),
+            or_(
+                CampusNotice.dept_id.is_(None),
+                CampusNotice.dept_id == user.dept_id,
+            ),
+            CampusNotice.audience.in_(["all", user.user_role]),
+            or_(
+                CampusNotice.expires_at.is_(None),
+                CampusNotice.expires_at >= now,
+            ),
+        )
+        .order_by(CampusNotice.published_at.desc())
+    )
+
+    return [
+        NoticeSchema(
+            id=notice.id,
+            title=notice.title,
+            content=notice.content,
+            dept_id=notice.dept_id,
+            audience=notice.audience,
+            source=notice.source,
+            published_at=notice.published_at.isoformat(),
+            expires_at=notice.expires_at.isoformat() if notice.expires_at else None,
+        )
+        for notice in result.scalars().all()
+    ]
+
+
 @app.post("/api/v1/session/new", response_model=SessionSchema)
 async def create_new_session(
     request: CreateSessionRequest,  # 改为接收 JSON Body
@@ -291,6 +721,9 @@ async def get_session_list(
 async def get_session_detail(session_id: str, user: UserContext = Depends(get_current_user)):
     if not user.is_authenticated() and user.user_role != ROLE_GUEST:
         raise HTTPException(status_code=401, detail="Login required")
+
+    if not history_manager.owns_session(user.user_id, session_id):
+        raise HTTPException(status_code=404, detail="Session not found or permission denied")
     
     messages = history_manager.get_session_history_detail(session_id)
     return SessionHistoryResponse(session_id=session_id, messages=messages)
@@ -353,9 +786,16 @@ async def chat_endpoint(
             for chunk in pipeline.execute(payload, user):
                 data = json.dumps({"chunk": chunk}, ensure_ascii=False)
                 yield f"data: {data}\n\n"
+            metadata = pipeline.consume_response_metadata()
+            meta_data = json.dumps({"metadata": metadata}, ensure_ascii=False)
+            yield f"data: {meta_data}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
-            err_msg = json.dumps({"error": str(e)})
+            logger.exception("Chat pipeline failed")
+            err_msg = json.dumps(
+                {"error": "问答服务暂时不可用，请稍后重试。"},
+                ensure_ascii=False,
+            )
             yield f"data: {err_msg}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

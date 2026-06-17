@@ -1,5 +1,5 @@
 // API基础配置
-const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://124.221.26.181:8000';
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 const API_PREFIX = import.meta.env.VITE_API_PREFIX || '/api/v1';
 
 // Token管理
@@ -19,24 +19,29 @@ const clearTokens = () => {
 
 // 通用请求函数
 async function request(url, options = {}) {
+  const { skipAuthRefresh = false, auth = true, ...fetchOptions } = options;
   const token = getAccessToken();
   const headers = {
     'Content-Type': 'application/json',
-    ...options.headers,
+    ...fetchOptions.headers,
   };
   
-  if (token) {
+  if (auth && token) {
     headers['Authorization'] = `Bearer ${token}`;
   }
 
   try {
     const response = await fetch(`${BASE_URL}${API_PREFIX}${url}`, {
-      ...options,
+      ...fetchOptions,
       headers,
     });
 
     // 处理401错误 - Token过期
     if (response.status === 401) {
+      if (skipAuthRefresh) {
+        const errorData = await response.json().catch(() => ({ detail: response.statusText }));
+        throw new Error(errorData.detail || `请求失败: ${response.status}`);
+      }
       const refreshToken = getRefreshToken();
       if (refreshToken) {
         try {
@@ -46,7 +51,7 @@ async function request(url, options = {}) {
             // 重试原请求
             headers['Authorization'] = `Bearer ${refreshResponse.access_token}`;
             return fetch(`${BASE_URL}${API_PREFIX}${url}`, {
-              ...options,
+              ...fetchOptions,
               headers,
             }).then(res => res.json());
           }
@@ -80,6 +85,8 @@ export const authAPI = {
   async login(username, password) {
     const response = await request('/login', {
       method: 'POST',
+      auth: false,
+      skipAuthRefresh: true,
       body: JSON.stringify({ username, password }),
     });
     setTokens(response.access_token, response.refresh_token);
@@ -164,10 +171,20 @@ export const sessionAPI = {
   },
 };
 
+export const profileAPI = {
+  async getMyProfile() {
+    return await request('/me/profile', { method: 'GET' });
+  },
+
+  async getNotices() {
+    return await request('/notices', { method: 'GET' });
+  },
+};
+
 // 聊天API
 export const chatAPI = {
   // 发送消息（SSE流式响应）
-  async sendMessage(type, query, sessionId, onChunk, onError, onComplete) {
+  async sendMessage(type, query, sessionId, onChunk, onError, onComplete, onMetadata) {
     const token = getAccessToken();
     const headers = {
       'Content-Type': 'application/json',
@@ -220,13 +237,22 @@ export const chatAPI = {
               return;
             }
 
+            let json;
             try {
-              const json = JSON.parse(data);
-              if (json.chunk && onChunk) {
-                onChunk(json.chunk);
-              }
+              json = JSON.parse(data);
             } catch (e) {
               console.error('Parse SSE data error:', e, data);
+              continue;
+            }
+            if (json.error) {
+              throw new Error(json.error);
+            }
+            if (json.metadata && onMetadata) {
+              onMetadata(json.metadata);
+              continue;
+            }
+            if (json.chunk && onChunk) {
+              onChunk(json.chunk);
             }
           }
         }
@@ -238,6 +264,49 @@ export const chatAPI = {
         throw error;
       }
     }
+  },
+};
+
+export const adminAPI = {
+  async listFaqs() {
+    return await request('/admin/faqs', { method: 'GET' });
+  },
+
+  async createFaq(payload) {
+    return await request('/admin/faqs', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async updateFaq(id, payload) {
+    return await request(`/admin/faqs/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async listKnowledge(collection = '') {
+    const suffix = collection ? `?collection=${encodeURIComponent(collection)}` : '';
+    return await request(`/admin/knowledge${suffix}`, { method: 'GET' });
+  },
+
+  async crawlPreview(url, maxPages = 8) {
+    return await request('/admin/crawl/preview', {
+      method: 'POST',
+      body: JSON.stringify({ url, max_pages: maxPages }),
+    });
+  },
+
+  async saveCrawl(sourceUrl, accessScope, blocks) {
+    return await request('/admin/crawl/save', {
+      method: 'POST',
+      body: JSON.stringify({
+        source_url: sourceUrl,
+        access_scope: accessScope,
+        blocks,
+      }),
+    });
   },
 };
 

@@ -11,10 +11,11 @@ class Settings(BaseSettings):
     GENERATE_MODEL_NAME: str = "qwen3-max"
 
     # JWT Config
-    JWT_SECRET_KEY: str = "tongji_rag_secret_key_2025"
-    JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "change-me-before-production")
+    JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
+    REFRESH_TOKEN_EXPIRE_DAYS: int = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", 7))
+    CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "http://localhost,http://127.0.0.1")
 
     # Redis Config
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
@@ -40,5 +41,9 @@ class Settings(BaseSettings):
     COLLECTION_PERSONAL: str = "rag_person_info"
 
     GLOBAL_SEED: int = 1234
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
 settings = Settings()
