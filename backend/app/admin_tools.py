@@ -37,6 +37,14 @@ def placeholder_vector(_: str) -> list[float]:
     return [0.0] * VECTOR_DIMENSION
 
 
+def extract_insert_ids(result: Any) -> list[Any]:
+    if isinstance(result, dict):
+        return result.get("ids") or []
+    if isinstance(result, list):
+        return result
+    return getattr(result, "ids", []) or []
+
+
 def sync_session_factory():
     database_url = (
         f"mysql+pymysql://{settings.MYSQL_USER}:{settings.MYSQL_PASSWORD}"
@@ -259,7 +267,7 @@ def save_blocks_to_knowledge_base(
         db.commit()
         if rows:
             result = client.insert(collection_name=collection, data=rows)
-            ids = result.get("ids") if isinstance(result, dict) else []
+            ids = extract_insert_ids(result)
             for crawl_block, milvus_id in zip(crawl_blocks, ids or []):
                 crawl_block.milvus_id = str(milvus_id)
             client.flush(collection_name=collection)

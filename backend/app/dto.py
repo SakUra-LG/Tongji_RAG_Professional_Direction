@@ -125,6 +125,14 @@ class StudentGradeSchema(BaseModel):
     credits: Optional[float] = None
 
 
+class StudentExamSchema(BaseModel):
+    id: int
+    subject: str
+    exam_time: str
+    location: Optional[str] = None
+    exam_method: Optional[str] = None
+
+
 class MyProfileResponse(BaseModel):
     user_id: str
     username: str
@@ -135,6 +143,7 @@ class MyProfileResponse(BaseModel):
     teacher_profile: Optional[TeacherProfileSchema] = None
     course_schedules: List[CourseScheduleSchema] = Field(default_factory=list)
     grades: List[StudentGradeSchema] = Field(default_factory=list)
+    exams: List[StudentExamSchema] = Field(default_factory=list)
 
 
 class NoticeSchema(BaseModel):
@@ -192,6 +201,14 @@ class AdminKnowledgeBlockSchema(BaseModel):
     text_content: Optional[str] = None
     milvus_id: Optional[str] = None
     created_at: str
+
+
+class AdminKnowledgeBlockUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    section: Optional[str] = None
+    url: Optional[str] = None
+    access_scope: Optional[str] = None
+    text_content: str = Field(min_length=1)
 
 
 class AdminCrawlPreviewRequest(BaseModel):

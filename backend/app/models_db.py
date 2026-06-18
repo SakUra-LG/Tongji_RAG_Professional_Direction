@@ -139,6 +139,30 @@ class StudentGrade(Base):
     credits = Column(Numeric(5, 2), nullable=True)
 
 
+class StudentExam(Base):
+    __tablename__ = "student_exams"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "subject",
+            "exam_time",
+            name="uq_user_exam_subject_time",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    subject = Column(String(150), nullable=False)
+    exam_time = Column(DateTime, nullable=False)
+    location = Column(String(150), nullable=True)
+    exam_method = Column(String(50), nullable=True)
+
+
 class CampusNotice(Base):
     __tablename__ = "campus_notices"
 

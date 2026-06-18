@@ -21,9 +21,10 @@ from app.dto import (
     RequestPayload, UserContext, LoginRequest, LoginResponse, RefreshRequest,
     SessionSchema, SessionListResponse, SessionHistoryResponse, CreateSessionRequest,
     CourseScheduleSchema, MyProfileResponse, NoticeSchema, StudentGradeSchema,
-    StudentProfileSchema, TeacherProfileSchema,
+    StudentExamSchema, StudentProfileSchema, TeacherProfileSchema,
     AdminCrawlPreviewRequest, AdminCrawlPreviewResponse, AdminCrawlSaveRequest,
     AdminFAQSchema, AdminFAQUpsertRequest, AdminKnowledgeBlockSchema,
+    AdminKnowledgeBlockUpdateRequest,
 )
 from app.database import get_db
 from app.models_db import (
@@ -32,12 +33,13 @@ from app.models_db import (
     CrawlBlock,
     CrawlTask,
     ManagedFAQ,
+    StudentExam,
     StudentGrade,
     StudentProfile,
     TeacherProfile,
     User,
 )
-from app.admin_tools import crawl_preview, save_blocks_to_knowledge_base
+from app.admin_tools import crawl_preview, extract_insert_ids, save_blocks_to_knowledge_base
 from app.pipelines import (
     AcademicPipeline,
     AutoPipeline,
@@ -343,6 +345,107 @@ def infer_access_scope(collection_name: str, block: CrawlBlock) -> str:
     return ""
 
 
+def collection_for_access_scope(access_scope: str | None, fallback: str) -> str:
+    if access_scope == "public":
+        return settings.COLLECTION_STANDARD
+    if access_scope == "campus":
+        return settings.COLLECTION_KNOWLEDGE
+    return fallback
+
+
+def admin_delete_milvus_rows(
+    collection_name: str,
+    milvus_id: str | None,
+    *,
+    title: str | None = None,
+    url: str | None = None,
+) -> int:
+    if not collection_name:
+        return 0
+    ids_to_delete: Set[int] = set()
+    if milvus_id:
+        ids_to_delete.add(int(milvus_id))
+
+    title = (title or "").strip()
+    url = (url or "").strip()
+    if title or url:
+        client = MilvusClient(uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}")
+        try:
+            rows = client.query(
+                collection_name=collection_name,
+                filter="",
+                output_fields=["id", "source"],
+                limit=10000,
+            )
+        except Exception as exc:
+            logger.warning("Failed to query Milvus sources before delete: %s", exc)
+            rows = []
+        exact_source = f"{title} | {url}" if title and url else ""
+        for row in rows:
+            source = str(row.get("source", ""))
+            if (
+                (exact_source and source == exact_source)
+                or (url and url in source)
+                or (title and source.startswith(title))
+            ):
+                ids_to_delete.add(int(row["id"]))
+
+    if not ids_to_delete:
+        return 0
+    client = MilvusClient(uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}")
+    client.delete(collection_name=collection_name, pks=sorted(ids_to_delete))
+    client.flush(collection_name=collection_name)
+    return len(ids_to_delete)
+
+
+def admin_insert_milvus_block(
+    *,
+    collection_name: str,
+    text: str,
+    title: str,
+    url: str,
+) -> str | None:
+    if not collection_name:
+        return None
+    client = MilvusClient(uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}")
+    result = client.insert(
+        collection_name=collection_name,
+        data=[
+            {
+                "vector": [0.0] * 1024,
+                "text": text,
+                "source": f"{title} | {url}",
+                "dept_id": "",
+                "user_id": "",
+            }
+        ],
+    )
+    client.flush(collection_name=collection_name)
+    ids = extract_insert_ids(result)
+    return str(ids[0]) if ids else None
+
+
+def knowledge_block_to_schema(
+    item: CrawlBlock,
+    task: CrawlTask | None = None,
+) -> AdminKnowledgeBlockSchema:
+    inferred_collection = infer_block_collection(item, task)
+    inferred_scope = infer_access_scope(inferred_collection, item)
+    return AdminKnowledgeBlockSchema(
+        id=item.id,
+        task_id=item.task_id,
+        title=item.title,
+        section=item.section,
+        url=item.url,
+        collection_name=inferred_collection,
+        access_scope=inferred_scope,
+        text_preview=item.text_preview,
+        text_content=item.text_content or item.text_preview,
+        milvus_id=item.milvus_id,
+        created_at=item.created_at.isoformat() if item.created_at else "",
+    )
+
+
 @app.get("/api/v1/admin/faqs", response_model=list[AdminFAQSchema])
 async def admin_list_faqs(
     _: UserContext = Depends(require_admin),
@@ -394,6 +497,22 @@ async def admin_update_faq(
     return faq_to_schema(faq)
 
 
+@app.delete("/api/v1/admin/faqs/{faq_id}")
+async def admin_delete_faq(
+    faq_id: int,
+    _: UserContext = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(ManagedFAQ).where(ManagedFAQ.id == faq_id))
+    faq = result.scalars().first()
+    if faq is None:
+        raise HTTPException(status_code=404, detail="FAQ not found")
+    await db.delete(faq)
+    await db.commit()
+    sync_faq_collection()
+    return {"deleted": True, "id": faq_id}
+
+
 @app.get("/api/v1/admin/knowledge", response_model=list[AdminKnowledgeBlockSchema])
 async def admin_list_knowledge(
     collection: str | None = None,
@@ -418,22 +537,7 @@ async def admin_list_knowledge(
         inferred_collection = infer_block_collection(item, task)
         if collection and inferred_collection != collection:
             continue
-        inferred_scope = infer_access_scope(inferred_collection, item)
-        blocks.append(
-            AdminKnowledgeBlockSchema(
-                id=item.id,
-                task_id=item.task_id,
-                title=item.title,
-                section=item.section,
-                url=item.url,
-                collection_name=inferred_collection,
-                access_scope=inferred_scope,
-                text_preview=item.text_preview,
-                text_content=item.text_content or item.text_preview,
-                milvus_id=item.milvus_id,
-                created_at=item.created_at.isoformat() if item.created_at else "",
-            )
-        )
+        blocks.append(knowledge_block_to_schema(item, task))
         if len(blocks) >= 200:
             break
 
@@ -460,6 +564,130 @@ async def admin_list_knowledge(
             if len(blocks) >= 200:
                 break
     return blocks
+
+
+@app.put("/api/v1/admin/knowledge/{block_id}", response_model=AdminKnowledgeBlockSchema)
+async def admin_update_knowledge(
+    block_id: int,
+    request: AdminKnowledgeBlockUpdateRequest,
+    _: UserContext = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    text_content = request.text_content.strip()
+    if not text_content:
+        raise HTTPException(status_code=400, detail="Text content is required")
+
+    if block_id < 0:
+        faq_id = abs(block_id)
+        result = await db.execute(select(ManagedFAQ).where(ManagedFAQ.id == faq_id))
+        faq = result.scalars().first()
+        if faq is None:
+            raise HTTPException(status_code=404, detail="FAQ not found")
+        faq.question = (request.title or faq.question).strip()
+        faq.answer = text_content
+        faq.source = faq.source or "后台FAQ"
+        await db.commit()
+        await db.refresh(faq)
+        sync_faq_collection()
+        return AdminKnowledgeBlockSchema(
+            id=-faq.id,
+            task_id=0,
+            title=faq.question,
+            section="FAQ",
+            url=f"faq://managed/{faq.id}",
+            collection_name=settings.COLLECTION_FAQ,
+            access_scope="public",
+            text_preview=faq.answer[:500],
+            text_content=faq.answer,
+            milvus_id=None,
+            created_at=faq.updated_at.isoformat() if faq.updated_at else "",
+        )
+
+    result = await db.execute(select(CrawlBlock).where(CrawlBlock.id == block_id))
+    block = result.scalars().first()
+    if block is None:
+        raise HTTPException(status_code=404, detail="Knowledge block not found")
+
+    task = None
+    if block.task_id:
+        task_result = await db.execute(select(CrawlTask).where(CrawlTask.id == block.task_id))
+        task = task_result.scalars().first()
+
+    old_collection = infer_block_collection(block, task)
+    new_access_scope = (request.access_scope or block.access_scope or "").strip()
+    new_collection = collection_for_access_scope(new_access_scope, old_collection)
+    title = (request.title or block.title or "未命名资料").strip()
+    url = (request.url or block.url or "").strip()
+
+    try:
+        admin_delete_milvus_rows(
+            old_collection,
+            block.milvus_id,
+            title=block.title,
+            url=block.url,
+        )
+        new_milvus_id = admin_insert_milvus_block(
+            collection_name=new_collection,
+            text=text_content,
+            title=title,
+            url=url,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Milvus sync failed: {exc}") from exc
+
+    block.title = title[:200]
+    block.section = (request.section or block.section or "综合资料").strip()[:50]
+    block.url = url
+    block.access_scope = new_access_scope or infer_access_scope(new_collection, block)
+    block.collection_name = new_collection
+    block.text_preview = text_content[:500]
+    block.text_content = text_content
+    block.milvus_id = new_milvus_id
+    await db.commit()
+    await db.refresh(block)
+    return knowledge_block_to_schema(block, task)
+
+
+@app.delete("/api/v1/admin/knowledge/{block_id}")
+async def admin_delete_knowledge(
+    block_id: int,
+    _: UserContext = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    if block_id < 0:
+        faq_id = abs(block_id)
+        result = await db.execute(select(ManagedFAQ).where(ManagedFAQ.id == faq_id))
+        faq = result.scalars().first()
+        if faq is None:
+            raise HTTPException(status_code=404, detail="FAQ not found")
+        await db.delete(faq)
+        await db.commit()
+        sync_faq_collection()
+        return {"deleted": True, "id": block_id}
+
+    result = await db.execute(select(CrawlBlock).where(CrawlBlock.id == block_id))
+    block = result.scalars().first()
+    if block is None:
+        raise HTTPException(status_code=404, detail="Knowledge block not found")
+
+    task = None
+    if block.task_id:
+        task_result = await db.execute(select(CrawlTask).where(CrawlTask.id == block.task_id))
+        task = task_result.scalars().first()
+    collection_name = infer_block_collection(block, task)
+    try:
+        admin_delete_milvus_rows(
+            collection_name,
+            block.milvus_id,
+            title=block.title,
+            url=block.url,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Milvus delete failed: {exc}") from exc
+
+    await db.delete(block)
+    await db.commit()
+    return {"deleted": True, "id": block_id}
 
 
 @app.post("/api/v1/admin/crawl/preview", response_model=AdminCrawlPreviewResponse)
@@ -500,6 +728,7 @@ async def get_my_profile(
     student_profile = None
     teacher_profile = None
     grades = []
+    exams = []
 
     if db_user.role == ROLE_STUDENT:
         result = await db.execute(
@@ -539,6 +768,22 @@ async def get_my_profile(
                     float(item.grade_point) if item.grade_point is not None else None
                 ),
                 credits=float(item.credits) if item.credits is not None else None,
+            )
+            for item in result.scalars().all()
+        ]
+
+        result = await db.execute(
+            select(StudentExam)
+            .where(StudentExam.user_id == db_user.id)
+            .order_by(StudentExam.id.asc())
+        )
+        exams = [
+            StudentExamSchema(
+                id=item.id,
+                subject=item.subject,
+                exam_time=item.exam_time.isoformat(timespec="minutes"),
+                location=item.location,
+                exam_method=item.exam_method,
             )
             for item in result.scalars().all()
         ]
@@ -604,6 +849,7 @@ async def get_my_profile(
         teacher_profile=teacher_profile,
         course_schedules=schedules,
         grades=grades,
+        exams=exams,
     )
 
 

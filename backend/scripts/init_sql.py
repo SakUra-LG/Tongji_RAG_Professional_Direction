@@ -1,7 +1,7 @@
 import asyncio
 import os
 import sys
-from datetime import time
+from datetime import datetime, time
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -15,6 +15,7 @@ from app.models_db import (
     CrawlBlock,
     CrawlTask,
     ManagedFAQ,
+    StudentExam,
     StudentGrade,
     StudentProfile,
     TeacherProfile,
@@ -219,6 +220,33 @@ async def seed_lee_schedule(session, lee: User) -> None:
         schedule.status = "selected"
 
 
+async def seed_lee_exams(session, lee: User) -> None:
+    exam_items = [
+        ("软件测试", datetime(2026, 6, 18, 10, 0), "安楼A210", "考查"),
+        ("数据分析与数据挖掘", datetime(2026, 6, 17, 13, 30), "广楼G107", "考查"),
+        ("软件工程管理与经济", datetime(2026, 6, 9, 18, 30), None, "考试"),
+    ]
+
+    for subject, exam_time, location, exam_method in exam_items:
+        result = await session.execute(
+            select(StudentExam).where(
+                StudentExam.user_id == lee.id,
+                StudentExam.subject == subject,
+                StudentExam.exam_time == exam_time,
+            )
+        )
+        exam = result.scalars().first()
+        if exam is None:
+            exam = StudentExam(
+                user_id=lee.id,
+                subject=subject,
+                exam_time=exam_time,
+            )
+            session.add(exam)
+        exam.location = location
+        exam.exam_method = exam_method
+
+
 async def seed_notices(session) -> None:
     notices = [
         {
@@ -285,6 +313,9 @@ async def remove_scholar_data(session) -> list[int]:
             delete(StudentGrade).where(StudentGrade.user_id.in_(scholar_ids))
         )
         await session.execute(
+            delete(StudentExam).where(StudentExam.user_id.in_(scholar_ids))
+        )
+        await session.execute(
             delete(StudentProfile).where(StudentProfile.user_id.in_(scholar_ids))
         )
         await session.execute(
@@ -343,6 +374,7 @@ async def init_db() -> list[int]:
 
             await seed_profiles(session, student, teacher, lee)
             await seed_lee_schedule(session, lee)
+            await seed_lee_exams(session, lee)
             await seed_notices(session)
             await seed_managed_faqs(session)
             reset_count = await reset_all_passwords(session, "123456")

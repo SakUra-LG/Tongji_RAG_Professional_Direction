@@ -286,9 +286,28 @@ export const adminAPI = {
     });
   },
 
+  async deleteFaq(id) {
+    return await request(`/admin/faqs/${id}`, {
+      method: 'DELETE',
+    });
+  },
+
   async listKnowledge(collection = '') {
     const suffix = collection ? `?collection=${encodeURIComponent(collection)}` : '';
     return await request(`/admin/knowledge${suffix}`, { method: 'GET' });
+  },
+
+  async updateKnowledge(id, payload) {
+    return await request(`/admin/knowledge/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async deleteKnowledge(id) {
+    return await request(`/admin/knowledge/${id}`, {
+      method: 'DELETE',
+    });
   },
 
   async crawlPreview(url, maxPages = 8) {

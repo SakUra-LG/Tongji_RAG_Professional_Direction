@@ -29,6 +29,7 @@ from app.models_db import (
     CampusNotice,
     CourseSchedule,
     ManagedFAQ,
+    StudentExam,
     StudentGrade,
     StudentProfile,
     TeacherProfile,
@@ -678,6 +679,7 @@ class QueryIntentRouter:
             ),
         ),
         ("grades", ("课程成绩", "我的成绩")),
+        ("exams", ("考试信息", "期末考试", "考试安排", "考试科目", "考试时间", "考试地点", "考试方式", "考查")),
         ("profile", ("个人信息", "个人档案", "我的信息", "我的档案")),
     )
     UNDER_SPECIFIED_ENTITY_QUERIES = {
@@ -1052,6 +1054,39 @@ class StructuredDataRetriever:
                         )
                     )
 
+                exams = list(
+                    session.scalars(
+                        select(StudentExam)
+                        .where(StudentExam.user_id == user_id)
+                        .order_by(StudentExam.id.asc())
+                    ).all()
+                )
+                if exams:
+                    exam_lines = ["期末考试信息："]
+                    for exam in exams:
+                        details = [
+                            exam.subject,
+                            (
+                                f"{exam.exam_time.month}月{exam.exam_time.day}日 "
+                                f"{exam.exam_time.strftime('%H:%M')}"
+                            ),
+                        ]
+                        if exam.location:
+                            details.append(exam.location)
+                        if exam.exam_method:
+                            details.append(exam.exam_method)
+                        exam_lines.append("- " + "；".join(details))
+
+                    documents.append(
+                        Document(
+                            id=f"mysql-exams-{user_id}",
+                            content="\n".join(exam_lines),
+                            score=1.0,
+                            source="MySQL学生考试信息",
+                            metadata={"user_id": str(user_id), "record_type": "exams"},
+                        )
+                    )
+
         return documents
 
     def get_routing_context(self, user: UserContext) -> Dict[str, Any]:
@@ -1289,6 +1324,9 @@ class StructuredDataRetriever:
             "班级",
             "学分",
             "成绩",
+            "考试",
+            "考查",
+            "期末",
             "校区",
             "学院",
             "院系",
@@ -1311,7 +1349,7 @@ class StructuredDataRetriever:
                 r"([^，。？！?\s]{1,30})的"
                 r"(?:绩点|gpa|排名|姓名|名字|身份|角色|学号|工号|专业|年级|"
                 r"班级|学分|成绩|校区|学院|院系|职称|办公室|研究方向|研究领域|"
-                r"课表|课程)",
+                r"课表|课程|考试|考查|期末)",
                 normalized,
             )
             if explicit_target:
@@ -1411,6 +1449,36 @@ class StructuredDataRetriever:
                             details.append(f"绩点 {grade.grade_point}")
                         if grade.credits is not None:
                             details.append(f"学分 {grade.credits}")
+                        lines.append("- " + "，".join(details))
+                    return "\n".join(lines)
+
+                if requested_field == "exams":
+                    exams = list(
+                        session.scalars(
+                            select(StudentExam)
+                            .where(StudentExam.user_id == user_id)
+                            .order_by(StudentExam.id.asc())
+                        ).all()
+                    )
+                    if not exams:
+                        return "暂无该生考试信息"
+                    lines = ["你的期末考试信息如下："]
+                    for exam in exams:
+                        exam_time = exam.exam_time
+                        time_text = (
+                            f"{exam_time.month}月{exam_time.day}日 "
+                            f"{exam_time.strftime('%H:%M')}"
+                            if hasattr(exam_time, "strftime")
+                            else str(exam_time)
+                        )
+                        details = [
+                            exam.subject,
+                            time_text,
+                        ]
+                        if exam.location:
+                            details.append(exam.location)
+                        if exam.exam_method:
+                            details.append(exam.exam_method)
                         lines.append("- " + "，".join(details))
                     return "\n".join(lines)
 
@@ -1619,7 +1687,7 @@ JSON 字段：
 personal_field 仅在 personal_fact 时填写，可选值：
 gpa, major_rank, name, role, student_no, employee_no, major,
 grade_year, class_name, earned_credits, campus, college, title,
-office, research_direction, schedule, grades, profile。
+office, research_direction, schedule, grades, exams, profile。
 personal_filters 用于保存个人数据查询中的条件。查询课表 schedule 时，如果用户限定了周几，
 必须输出 weekday：周一=1，周二=2，周三=3，周四=4，周五=5，周六=6，周日/周天=7；
 如果限定上午/下午/晚上，输出 period=morning/afternoon/evening；如果限定具体时间，
@@ -1639,8 +1707,9 @@ personal_action 仅在 personal_field=schedule 时填写：
 实体，必须使用身份上下文把它改写成具体学院名称并路由 campus_knowledge。
 3. “我的专业就业情况如何”询问专业这一校园实体，不是返回专业名称。
 4. “我的绩点是多少”才是 personal_fact；“如何查询绩点”是 procedure。
-5. 不得因为句子含有“学院、专业、绩点”等词就直接选择 personal_fact。
-6. 只有 personal_fact 路由允许读取私有档案。""",
+5. “我的考试信息/期末考试安排/考试时间地点”是 personal_fact，personal_field 必须为 exams。
+6. 不得因为句子含有“学院、专业、绩点”等词就直接选择 personal_fact。
+7. 只有 personal_fact 路由允许读取私有档案。""",
             ),
             (
                 "human",

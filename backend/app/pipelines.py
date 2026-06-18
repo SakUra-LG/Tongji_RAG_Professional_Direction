@@ -42,7 +42,7 @@ class BasePipeline(ABC):
     def _source_type(doc: Document) -> str:
         if doc.metadata.get("is_faq"):
             return "faq"
-        if doc.metadata.get("record_type") in {"profile", "schedule", "grades"}:
+        if doc.metadata.get("record_type") in {"profile", "schedule", "grades", "exams"}:
             return "personal"
         if doc.metadata.get("record_type") == "notice":
             return "notice"
@@ -455,7 +455,7 @@ class AutoPipeline(BasePipeline):
                             content=direct_answer,
                             score=1.0,
                             source="MySQL个人档案",
-                            metadata={"record_type": "profile"},
+                            metadata={"record_type": route.personal_field or "profile"},
                         )
                     ],
                     answer_origin="personal",

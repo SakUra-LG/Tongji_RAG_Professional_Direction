@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue';
-import { BookOpen, Database, FilePlus, RefreshCw, Save, X } from 'lucide-vue-next';
+import { BookOpen, Database, FilePlus, Pencil, RefreshCw, Save, Trash2, X } from 'lucide-vue-next';
 import { adminAPI } from '../api/api.js';
 
 const emit = defineEmits(['close']);
@@ -15,6 +15,21 @@ const faqForm = ref({ question: '', answer: '', source: '', aliases: '', is_acti
 
 const knowledge = ref([]);
 const collectionFilter = ref('');
+const selectedKnowledge = ref(null);
+const knowledgeForm = ref({
+  title: '',
+  section: '',
+  url: '',
+  access_scope: 'public',
+  text_content: ''
+});
+const confirmDialog = ref({
+  visible: false,
+  title: '',
+  body: '',
+  danger: false,
+  action: null
+});
 
 const crawlUrl = ref('https://www.tongji.edu.cn/');
 const maxPages = ref(8);
@@ -41,12 +56,42 @@ const setMessage = (text) => {
   }
 };
 
+const askConfirm = ({ title, body, danger = false, action }) => {
+  confirmDialog.value = {
+    visible: true,
+    title,
+    body,
+    danger,
+    action
+  };
+};
+
+const closeConfirm = () => {
+  confirmDialog.value = {
+    visible: false,
+    title: '',
+    body: '',
+    danger: false,
+    action: null
+  };
+};
+
+const confirmAction = async () => {
+  const action = confirmDialog.value.action;
+  closeConfirm();
+  if (action) await action();
+};
+
 const loadFaqs = async () => {
   faqs.value = await adminAPI.listFaqs();
 };
 
 const loadKnowledge = async () => {
   knowledge.value = await adminAPI.listKnowledge(collectionFilter.value);
+  if (selectedKnowledge.value) {
+    const refreshed = knowledge.value.find((item) => item.id === selectedKnowledge.value.id);
+    if (!refreshed) clearKnowledgeSelection();
+  }
 };
 
 const selectFaq = (faq) => {
@@ -88,6 +133,92 @@ const saveFaq = async () => {
   } finally {
     loading.value = false;
   }
+};
+
+const deleteFaq = async () => {
+  if (!selectedFaq.value) return;
+  askConfirm({
+    title: '系统提示',
+    body: '确定删除这条 FAQ 吗？确认后会删除数据库记录，并同步刷新 FAQ 向量库。',
+    danger: true,
+    action: async () => {
+      loading.value = true;
+      try {
+        await adminAPI.deleteFaq(selectedFaq.value.id);
+        await Promise.all([loadFaqs(), loadKnowledge()]);
+        newFaq();
+        setMessage('FAQ 已删除并同步到向量库');
+      } catch (error) {
+        setMessage(error.message || 'FAQ 删除失败');
+      } finally {
+        loading.value = false;
+      }
+    }
+  });
+};
+
+const selectKnowledge = (item) => {
+  selectedKnowledge.value = item;
+  knowledgeForm.value = {
+    title: item.title || '',
+    section: item.section || '',
+    url: item.url || '',
+    access_scope: item.access_scope || (item.collection_name === 'rag_standard' ? 'public' : 'campus'),
+    text_content: item.text_content || item.text_preview || ''
+  };
+};
+
+const clearKnowledgeSelection = () => {
+  selectedKnowledge.value = null;
+  knowledgeForm.value = {
+    title: '',
+    section: '',
+    url: '',
+    access_scope: 'public',
+    text_content: ''
+  };
+};
+
+const saveKnowledge = async () => {
+  if (!selectedKnowledge.value) return;
+  loading.value = true;
+  try {
+    await adminAPI.updateKnowledge(selectedKnowledge.value.id, {
+      title: knowledgeForm.value.title,
+      section: knowledgeForm.value.section,
+      url: knowledgeForm.value.url,
+      access_scope: knowledgeForm.value.access_scope,
+      text_content: knowledgeForm.value.text_content
+    });
+    await Promise.all([loadKnowledge(), loadFaqs()]);
+    clearKnowledgeSelection();
+    setMessage('资料记录已保存并同步到向量库');
+  } catch (error) {
+    setMessage(error.message || '资料保存失败');
+  } finally {
+    loading.value = false;
+  }
+};
+
+const deleteKnowledge = async (item) => {
+  askConfirm({
+    title: '系统提示',
+    body: '确定删除这整条资料记录吗？确认后会删除 MySQL 中的资料记录，并同步删除对应向量库记录。',
+    danger: true,
+    action: async () => {
+      loading.value = true;
+      try {
+        await adminAPI.deleteKnowledge(item.id);
+        await Promise.all([loadKnowledge(), loadFaqs()]);
+        if (selectedKnowledge.value?.id === item.id) clearKnowledgeSelection();
+        setMessage('资料记录已删除');
+      } catch (error) {
+        setMessage(error.message || '资料删除失败');
+      } finally {
+        loading.value = false;
+      }
+    }
+  });
 };
 
 const runPreview = async () => {
@@ -269,6 +400,14 @@ onMounted(async () => {
                 <button class="inline-flex items-center gap-2 rounded bg-cyan-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-60" :disabled="loading" @click="saveFaq">
                   <Save size="16" /> 保存 FAQ
                 </button>
+                <button
+                  v-if="selectedFaq"
+                  class="ml-2 inline-flex items-center gap-2 rounded border border-red-200 px-4 py-2 text-sm font-semibold text-red-600 hover:bg-red-50 disabled:opacity-60"
+                  :disabled="loading"
+                  @click="deleteFaq"
+                >
+                  <Trash2 size="16" /> 删除
+                </button>
               </div>
             </div>
           </section>
@@ -288,11 +427,65 @@ onMounted(async () => {
                 <RefreshCw size="16" /> 刷新
               </button>
             </div>
+
+            <div v-if="selectedKnowledge" class="border rounded-lg p-4 space-y-3 bg-slate-50">
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <div class="text-sm font-semibold text-slate-800">编辑资料记录</div>
+                  <div class="text-xs text-slate-500">{{ selectedKnowledge.collection_name }} · #{{ selectedKnowledge.id }}</div>
+                </div>
+                <button class="p-2 rounded hover:bg-white text-slate-500" @click="clearKnowledgeSelection">
+                  <X size="16" />
+                </button>
+              </div>
+              <div class="grid grid-cols-1 lg:grid-cols-[1fr_180px_180px] gap-3">
+                <label class="space-y-1">
+                  <span class="text-xs font-semibold text-slate-500">标题 / 问题</span>
+                  <input v-model="knowledgeForm.title" class="w-full rounded border border-slate-200 px-3 py-2 text-sm" />
+                </label>
+                <label class="space-y-1">
+                  <span class="text-xs font-semibold text-slate-500">分类</span>
+                  <input v-model="knowledgeForm.section" class="w-full rounded border border-slate-200 px-3 py-2 text-sm" />
+                </label>
+                <label class="space-y-1">
+                  <span class="text-xs font-semibold text-slate-500">访问范围</span>
+                  <select v-model="knowledgeForm.access_scope" class="w-full rounded border border-slate-200 px-3 py-2 text-sm">
+                    <option value="public">访客可访问</option>
+                    <option value="campus">仅限师生</option>
+                  </select>
+                </label>
+              </div>
+              <label class="block space-y-1">
+                <span class="text-xs font-semibold text-slate-500">来源 URL</span>
+                <input v-model="knowledgeForm.url" class="w-full rounded border border-slate-200 px-3 py-2 text-xs text-cyan-700" />
+              </label>
+              <label class="block space-y-1">
+                <span class="text-xs font-semibold text-slate-500">资料内容 / 答案</span>
+                <textarea v-model="knowledgeForm.text_content" rows="8" class="w-full rounded border border-slate-200 px-3 py-2 text-sm leading-relaxed" />
+              </label>
+              <div class="flex items-center gap-2">
+                <button class="inline-flex items-center gap-2 rounded bg-cyan-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-60" :disabled="loading" @click="saveKnowledge">
+                  <Save size="16" /> 保存记录
+                </button>
+                <button class="inline-flex items-center gap-2 rounded border border-red-200 px-4 py-2 text-sm font-semibold text-red-600 hover:bg-red-50 disabled:opacity-60" :disabled="loading" @click="deleteKnowledge(selectedKnowledge)">
+                  <Trash2 size="16" /> 删除整条
+                </button>
+              </div>
+            </div>
+
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
               <div v-for="item in knowledge" :key="item.id" class="rounded-lg border border-slate-200 p-3 space-y-2">
                 <div class="flex items-start justify-between gap-3">
                   <div class="font-semibold text-sm text-slate-800">{{ item.title || '资料块' }}</div>
-                  <span class="text-[11px] rounded bg-slate-100 px-2 py-0.5 text-slate-500">{{ item.collection_name || 'unknown' }}</span>
+                  <div class="flex items-center gap-2">
+                    <span class="text-[11px] rounded bg-slate-100 px-2 py-0.5 text-slate-500">{{ item.collection_name || 'unknown' }}</span>
+                    <button class="p-1.5 rounded text-slate-500 hover:bg-slate-100" title="编辑" @click="selectKnowledge(item)">
+                      <Pencil size="14" />
+                    </button>
+                    <button class="p-1.5 rounded text-red-500 hover:bg-red-50" title="删除" @click="deleteKnowledge(item)">
+                      <Trash2 size="14" />
+                    </button>
+                  </div>
                 </div>
                 <a :href="item.url" target="_blank" rel="noopener noreferrer" class="block text-xs text-cyan-700 truncate">{{ item.url }}</a>
                 <p class="text-xs leading-relaxed text-slate-600">{{ item.text_content || item.text_preview }}</p>
@@ -300,6 +493,34 @@ onMounted(async () => {
             </div>
           </section>
         </main>
+      </div>
+
+      <div v-if="confirmDialog.visible" class="absolute inset-0 z-10 flex items-center justify-center bg-slate-950/35 px-4">
+        <div class="w-full max-w-sm rounded-lg border border-slate-200 bg-white shadow-2xl">
+          <div class="border-b px-4 py-3">
+            <h3 class="text-base font-semibold text-slate-900">{{ confirmDialog.title }}</h3>
+          </div>
+          <div class="px-4 py-4">
+            <p class="text-sm leading-6 text-slate-600">{{ confirmDialog.body }}</p>
+          </div>
+          <div class="flex justify-end gap-2 border-t bg-slate-50 px-4 py-3">
+            <button
+              class="rounded border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-white"
+              :disabled="loading"
+              @click="closeConfirm"
+            >
+              取消
+            </button>
+            <button
+              class="rounded px-4 py-2 text-sm font-semibold text-white disabled:opacity-60"
+              :class="confirmDialog.danger ? 'bg-red-600 hover:bg-red-700' : 'bg-cyan-700 hover:bg-cyan-800'"
+              :disabled="loading"
+              @click="confirmAction"
+            >
+              确定
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
