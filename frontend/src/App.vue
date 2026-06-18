@@ -467,7 +467,7 @@ const handleTypeDeleteConversation = async (type, id) => {
 };
 
 // 发送消息（指定type）
-const handleTypeSend = async (type, text) => {
+const handleTypeSend = async (type, text, enableRag = true) => {
   if (!typeSessions.value[type].currentId) {
     await handleTypeNewConversation(type);
   }
@@ -528,7 +528,8 @@ const handleTypeSend = async (type, text) => {
         if (msg) {
           msg.metadata = metadata;
         }
-      }
+      },
+      { enableRag }
     );
   } catch (error) {
     console.error('发送消息失败:', error);
@@ -1335,7 +1336,7 @@ onMounted(async () => {
           :messages="currentMessages"
           :exampleQuestions="getExampleQuestions(currentType)"
           :welcomeTitle="getWelcomeTitle(currentType)"
-          @send-message="(text) => handleTypeSend(currentType, text)"
+          @send-message="(text, enableRag) => handleTypeSend(currentType, text, enableRag)"
           @new-conversation="() => handleTypeNewConversation(currentType)"
           @switch-conversation="(id) => handleTypeSwitchConversation(currentType, id)"
           @delete-conversation="(id) => handleTypeDeleteConversation(currentType, id)"

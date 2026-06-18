@@ -32,6 +32,7 @@ class RequestPayload(BaseModel):
     query: str = Field(min_length=1, max_length=4000)
     session_id: str
     stream: bool = True
+    enable_rag: bool = True
     
 class Document(BaseModel):
     id: str

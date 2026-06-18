@@ -78,9 +78,9 @@ class BasePipeline(ABC):
             notice = "当前资料库中未检索到足够相关资料，以下回答由大模型基于通用知识生成，请以学校官方信息为准。"
         else:
             max_score = max(float(doc.score or 0.0) for doc in docs)
-            if max_score >= 0.78 or len(docs) >= 3:
+            if max_score >= 0.78:
                 confidence = "high"
-            elif max_score >= 0.45:
+            elif max_score >= 0.45 or len(docs) >= 3:
                 confidence = "medium"
             else:
                 confidence = "low"
@@ -177,6 +177,7 @@ class BasePipeline(ABC):
         self,
         query: str,
         session_id: str,
+        notice: str | None = None,
     ) -> Generator[str, None, None]:
         full_answer = ""
         try:
@@ -195,7 +196,7 @@ class BasePipeline(ABC):
         self._last_response_metadata = {
             "answer_origin": "llm",
             "confidence": "low",
-            "notice": "已按用户要求跳过资料库检索，本次回答由大模型基于通用知识生成，请以权威来源为准。",
+            "notice": notice or "已按用户要求跳过资料库检索，本次回答由大模型基于通用知识生成，请以权威来源为准。",
             "sources": [],
         }
 
@@ -203,6 +204,13 @@ class BasePipeline(ABC):
         self._reset_metadata()
         # 获取历史
         history = self.history_mgr.get_recent_turns(request.session_id)
+        if not request.enable_rag:
+            self.history_mgr.append_user_message(request.session_id, request.query)
+            yield from self._answer_with_llm_only(
+                request.query,
+                request.session_id,
+            )
+            return
         early_llm_only_query = self._extract_llm_only_query(request.query)
         if early_llm_only_query:
             self.history_mgr.append_user_message(request.session_id, request.query)
@@ -324,6 +332,30 @@ class AutoPipeline(BasePipeline):
     FAQ_THRESHOLD = 0.8
     PERSONAL_VECTOR_THRESHOLD = 0.55
     CAMPUS_VECTOR_THRESHOLD = 0.45
+    GENERIC_QUERY_TERMS = {
+        "同济",
+        "同济大学",
+        "大学",
+        "学校",
+        "学院",
+        "介绍",
+        "简介",
+        "信息",
+        "资料",
+        "情况",
+        "当前",
+        "目前",
+        "现在",
+        "多少",
+        "几个",
+        "哪些",
+        "什么",
+        "如何",
+        "怎么",
+        "一下",
+        "具体",
+        "相关",
+    }
 
     @staticmethod
     def _can_attempt_faq(route_intent: str, query: str) -> bool:
@@ -332,16 +364,23 @@ class AutoPipeline(BasePipeline):
         return LocalFAQRetriever.is_specific_faq_query(query)
 
     @staticmethod
+    def _query_keywords(query: str) -> set[str]:
+        return {
+            word.strip()
+            for word in jieba.lcut_for_search(query)
+            if len(word.strip()) > 1
+            and word.strip() not in AutoPipeline.GENERIC_QUERY_TERMS
+        }
+
+    @staticmethod
     def _is_relevant(query: str, doc: Document, threshold: float) -> bool:
         if doc.score < threshold:
             return False
-        keywords = {
-            word
-            for word in jieba.lcut_for_search(query)
-            if len(word.strip()) > 1
-        }
-        has_keyword = any(word in doc.content for word in keywords)
-        return has_keyword or doc.score >= 0.75
+        keywords = AutoPipeline._query_keywords(query)
+        if not keywords:
+            return doc.score >= 0.75
+        searchable = f"{doc.content}\n{doc.source}"
+        return any(word in searchable for word in keywords)
 
     @staticmethod
     def _filter_notices(query: str, docs: List[Document]) -> List[Document]:
@@ -358,10 +397,84 @@ class AutoPipeline(BasePipeline):
             if any(word in doc.content for word in keywords)
         ]
 
+    @staticmethod
+    def _guest_requires_internal_access(query: str, route_intent: str) -> bool:
+        if route_intent == "clarification":
+            return False
+        normalized = re.sub(r"\s+", "", query)
+        internal_markers = (
+            "计算机学院",
+            "计算机科学与技术学院",
+            "软件学院",
+            "学院官网",
+            "我的学院",
+            "我所在的学院",
+            "我所属的学院",
+            "专任教师",
+            "师资",
+            "导师",
+            "院长",
+            "书记",
+            "研究所",
+            "实验室",
+            "培养方案",
+            "课程设置",
+            "专业设置",
+            "校内通知",
+            "学院通知",
+            "学院公告",
+            "学院新闻",
+            "内部",
+            "校内爬取",
+        )
+        return any(marker in normalized for marker in internal_markers)
+
+    def _deny_guest_internal_access(self, session_id: str) -> Generator[str, None, None]:
+        answer = (
+            "无权限：访客账号不能访问 Internal（校内爬取）资料库。"
+            "请使用在校师生账号登录后，再查询学院内部资料、通知或个人/学院信息。"
+        )
+        self.history_mgr.append_ai_message(session_id, answer)
+        self._last_response_metadata = {
+            "answer_origin": "permission",
+            "confidence": "low",
+            "notice": "访客无权访问 Internal（校内爬取）资料库，本次未进行该库检索。",
+            "sources": [],
+        }
+        yield answer
+
+    @staticmethod
+    def _looks_insufficient_answer(answer: str) -> bool:
+        normalized = re.sub(r"\s+", "", answer or "")
+        markers = (
+            "资料中未提供",
+            "资料库中未提供",
+            "资料库未提供",
+            "资料未提供",
+            "资料不足",
+            "资料中没有",
+            "未提供",
+            "未检索到",
+            "没有检索到",
+            "未找到相关",
+            "没有找到相关",
+            "无法确认",
+            "暂时无法确认",
+            "未提及",
+            "未明确提及",
+        )
+        return any(marker in normalized for marker in markers)
+
     def execute(self, request: RequestPayload, user: UserContext) -> Generator[str, None, None]:
         self._reset_metadata()
         history = self.history_mgr.get_recent_turns(request.session_id)
         self.history_mgr.append_user_message(request.session_id, request.query)
+        if not request.enable_rag:
+            yield from self._answer_with_llm_only(
+                request.query,
+                request.session_id,
+            )
+            return
         llm_only_query = self._extract_llm_only_query(request.query)
         if llm_only_query:
             yield from self._answer_with_llm_only(
@@ -382,6 +495,16 @@ class AutoPipeline(BasePipeline):
             routing_context,
         )
         query = route.rewritten_query or request.query
+
+        if (
+            user.user_role == "guest"
+            and self._guest_requires_internal_access(
+                f"{request.query} {query}",
+                route.intent,
+            )
+        ):
+            yield from self._deny_guest_internal_access(request.session_id)
+            return
 
         if route.intent == "clarification":
             if QueryIntentRouter.has_schedule_time_constraint(request.query):
@@ -583,6 +706,7 @@ class AutoPipeline(BasePipeline):
             docs,
             prompt,
             request.session_id,
+            allow_llm_fallback_on_insufficient=True,
         )
 
     def _explain_resolved_course(
@@ -687,24 +811,55 @@ class AutoPipeline(BasePipeline):
         docs: List[Document],
         prompt: str,
         session_id: str,
+        allow_llm_fallback_on_insufficient: bool = False,
     ) -> Generator[str, None, None]:
         full_answer = ""
         try:
             for chunk in self.llm_service.generate_answer(query, docs, prompt):
                 full_answer += chunk
-                yield chunk
         except Exception:
             logger.exception("Auto answer generation failed")
             if docs:
                 full_answer = self._format_document_fallback(query, docs)
             else:
                 full_answer = SERVICE_UNAVAILABLE_MESSAGE
+
+        used_llm_fallback = False
+        if (
+            allow_llm_fallback_on_insufficient
+            and docs
+            and self._looks_insufficient_answer(full_answer)
+        ):
+            used_llm_fallback = True
+            full_answer = ""
+            try:
+                for chunk in self.llm_service.generate_answer(
+                    query,
+                    [],
+                    self._fallback_prompt(),
+                ):
+                    full_answer += chunk
+                    yield chunk
+            except Exception:
+                logger.exception("Fallback LLM answer generation failed")
+                full_answer = SERVICE_UNAVAILABLE_MESSAGE
+                yield full_answer
+        else:
             yield full_answer
+
         self.history_mgr.append_ai_message(session_id, full_answer)
-        self._last_response_metadata = self._build_response_metadata(
-            docs=docs,
-            answer_origin="rag" if docs else "llm",
-        )
+        if used_llm_fallback:
+            self._last_response_metadata = {
+                "answer_origin": "llm",
+                "confidence": "low",
+                "notice": "当前资料库中没有此类资料，本次答案由大模型基于通用知识生成，请以学校官方信息为准。",
+                "sources": [],
+            }
+        else:
+            self._last_response_metadata = self._build_response_metadata(
+                docs=docs,
+                answer_origin="rag" if docs else "llm",
+            )
 
     @staticmethod
     def _format_document_fallback(
@@ -837,6 +992,13 @@ class PublicPipeline(BasePipeline):
         # 记录上下文 查询重写
         history = self.history_mgr.get_recent_turns(request.session_id)
         self.history_mgr.append_user_message(request.session_id, request.query)
+
+        if not request.enable_rag:
+            yield from self._answer_with_llm_only(
+                request.query,
+                request.session_id,
+            )
+            return
 
         llm_only_query = self._extract_llm_only_query(request.query)
         if llm_only_query:

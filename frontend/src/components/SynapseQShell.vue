@@ -1,6 +1,6 @@
 <script setup>
 import { ref, watch, computed } from 'vue';
-import { Menu, Database, X, Shield, MessageSquare, Plus, Trash2, LogOut } from 'lucide-vue-next';
+import { Menu, Database, X, Shield, MessageSquare, Plus, Trash2, LogOut, Send } from 'lucide-vue-next';
 
 const props = defineProps({
   themeColor: { type: String, default: 'blue' },
@@ -19,6 +19,7 @@ const props = defineProps({
 const emit = defineEmits(['send-message', 'new-conversation', 'switch-conversation', 'delete-conversation', 'logout']);
 
 const inputText = ref('');
+const ragEnabled = ref(true);
 const sidebarOpen = ref(true);
 const rightPanelOpen = ref(true);
 const messagesEndRef = ref(null);
@@ -79,12 +80,12 @@ const themeStyles = computed(() => ({
 
 const handleSend = () => {
   if (!inputText.value.trim()) return;
-  emit('send-message', inputText.value.trim());
+  emit('send-message', inputText.value.trim(), ragEnabled.value);
   inputText.value = '';
 };
 
 const handleExampleClick = (question) => {
-  emit('send-message', question);
+  emit('send-message', question, ragEnabled.value);
 };
 
 const formatContent = (content = '') => {
@@ -101,7 +102,7 @@ const confidenceLabel = (value) => {
   const map = {
     high: '置信度高',
     medium: '置信度中',
-    low: '资料不足'
+    low: '置信度低'
   };
   return map[value] || '来源提示';
 };
@@ -348,23 +349,32 @@ const showWelcome = computed(() => {
       </div>
 
       <div class="p-4 bg-white border-t border-slate-200">
-        <div class="max-w-4xl mx-auto relative">
+        <div class="max-w-4xl mx-auto flex items-end gap-2">
           <textarea
             v-model="inputText"
             @keydown.enter.prevent="!$event.shiftKey && handleSend()"
             placeholder="向 SynapseQ 提问..."
-            class="w-full pl-4 pr-14 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-cyan-500/20 focus:border-cyan-500 resize-none text-sm shadow-inner"
+            class="min-h-11 flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-cyan-500/20 focus:border-cyan-500 resize-none text-sm shadow-inner"
             rows="1"
           />
           <button
+            @click="ragEnabled = !ragEnabled"
+            type="button"
+            class="h-11 px-3 rounded-xl transition-colors shadow-sm border inline-flex items-center gap-1.5 text-xs font-semibold shrink-0"
+            :class="ragEnabled ? 'bg-cyan-50 text-cyan-700 border-cyan-200 hover:bg-cyan-100' : 'bg-slate-100 text-slate-500 border-slate-200 hover:bg-slate-200'"
+            :title="ragEnabled ? '资料库已启用' : '仅用大模型回答'"
+            :aria-label="ragEnabled ? '关闭资料库' : '启用资料库'"
+            :aria-pressed="ragEnabled"
+          >
+            <Database class="w-5 h-5" />
+            <span>{{ ragEnabled ? '资料库' : 'LLM' }}</span>
+          </button>
+          <button
             @click="handleSend"
-            class="absolute right-2 top-2 p-1.5 bg-cyan-700 text-white rounded-xl hover:bg-cyan-800 transition-colors shadow-md disabled:opacity-50"
+            class="h-11 w-11 bg-cyan-700 text-white rounded-xl hover:bg-cyan-800 transition-colors shadow-md disabled:opacity-50 inline-flex items-center justify-center shrink-0"
             :disabled="!inputText.trim()"
           >
-            <svg viewBox="0 0 24 24" class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="22" y1="2" x2="11" y2="13" />
-              <polygon points="22 2 15 22 11 13 2 9 22 2" />
-            </svg>
+            <Send class="w-5 h-5" />
           </button>
         </div>
       </div>

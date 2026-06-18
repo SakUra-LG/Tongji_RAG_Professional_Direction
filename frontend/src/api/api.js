@@ -184,7 +184,7 @@ export const profileAPI = {
 // 聊天API
 export const chatAPI = {
   // 发送消息（SSE流式响应）
-  async sendMessage(type, query, sessionId, onChunk, onError, onComplete, onMetadata) {
+  async sendMessage(type, query, sessionId, onChunk, onError, onComplete, onMetadata, options = {}) {
     const token = getAccessToken();
     const headers = {
       'Content-Type': 'application/json',
@@ -202,6 +202,7 @@ export const chatAPI = {
           query,
           session_id: sessionId,
           stream: true,
+          enable_rag: options.enableRag !== false,
         }),
       });
 
