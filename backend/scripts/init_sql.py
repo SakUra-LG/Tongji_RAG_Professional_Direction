@@ -92,6 +92,7 @@ async def ensure_user(
     full_name: str,
     role: str,
     dept_id: str,
+    update_password: bool = False,
 ) -> User:
     result = await session.execute(select(User).where(User.username == username))
     user = result.scalars().first()
@@ -112,6 +113,8 @@ async def ensure_user(
     user.role = role
     user.dept_id = dept_id
     user.is_active = True
+    if update_password:
+        user.hashed_password = get_hash(password)
     return user
 
 
@@ -247,6 +250,48 @@ async def seed_lee_exams(session, lee: User) -> None:
         exam.exam_method = exam_method
 
 
+async def seed_zeq_profile(session, zeq: User) -> None:
+    result = await session.execute(
+        select(StudentProfile).where(StudentProfile.user_id == zeq.id)
+    )
+    profile = result.scalars().first()
+    if profile is None:
+        profile = StudentProfile(user_id=zeq.id)
+        session.add(profile)
+
+    profile.college_name = "电子信息学院"
+    profile.major = "通信工程"
+    profile.gpa = 4.96
+
+
+async def seed_zeq_exams(session, zeq: User) -> None:
+    exam_items = [
+        ("无线通信原理", datetime(2026, 6, 22, 13, 30), "博楼B314"),
+        ("计算机通信网络", datetime(2026, 6, 24, 10, 30), "博楼B214"),
+        ("信息交换技术", datetime(2026, 6, 23, 10, 30), "博楼B311"),
+        ("光纤通信系统", datetime(2026, 6, 26, 10, 30), "博楼B312"),
+    ]
+
+    for subject, exam_time, location in exam_items:
+        result = await session.execute(
+            select(StudentExam).where(
+                StudentExam.user_id == zeq.id,
+                StudentExam.subject == subject,
+                StudentExam.exam_time == exam_time,
+            )
+        )
+        exam = result.scalars().first()
+        if exam is None:
+            exam = StudentExam(
+                user_id=zeq.id,
+                subject=subject,
+                exam_time=exam_time,
+            )
+            session.add(exam)
+        exam.location = location
+        exam.exam_method = None
+
+
 async def seed_notices(session) -> None:
     notices = [
         {
@@ -378,12 +423,23 @@ async def init_db() -> list[int]:
             await seed_notices(session)
             await seed_managed_faqs(session)
             reset_count = await reset_all_passwords(session, "123456")
+            zeq = await ensure_user(
+                session,
+                username="zeq",
+                password="050922",
+                full_name="zeq",
+                role="student",
+                dept_id="EIE",
+                update_password=True,
+            )
+            await seed_zeq_profile(session, zeq)
+            await seed_zeq_exams(session, zeq)
             await session.commit()
 
             if removed_scholar_ids:
                 print(f"Removed scholar users: {removed_scholar_ids}")
             print(
-                "Student, teacher, admin, profile, course, notice, and FAQ data are ready. "
+                "Student, teacher, admin, zeq, profile, course, exam, notice, and FAQ data are ready. "
                 f"Reset {reset_count} user passwords."
             )
             return removed_scholar_ids
